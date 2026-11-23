@@ -1,133 +1,303 @@
-# ScarlettX
+# ScarlettX — large-title bring-up fork
 
-**ScarlettX** is an experimental, open-source high-level emulator (HLE) for **Xbox Series X|S (Scarlett / Gen9 Game Core)** x86-64 software, designed to execute legally obtained GDK titles end-to-end by emulating the Scarlett OS, Game Core runtime, unified memory model, `d3d12_xs`, and ray-tracing (`XboxBvhBuilder` / DXR) stack.
+This is a fork of [**Freminet/ScarlettX**](https://github.com/Freminet/ScarlettX), an experimental, clean-room
+high-level emulator (HLE) / compatibility layer for **Xbox Series X|S (Scarlett, GDK)** x86-64 titles on Windows.
+All credit for the emulator itself goes to the upstream author. The original project README is kept unchanged
+in [`UPSTREAM_README.md`](UPSTREAM_README.md).
 
-> **Legal notice:** ScarlettX does not include, decrypt, or distribute any proprietary Microsoft/Xbox binaries, keys, firmware, or commercial game assets. All automated tests run against synthetic x86-64 PE titles built from source in this repository.
+This fork records an attempt to bring up a **large, recent AAA retail title** (Rockstar Games' *Grand Theft Auto VI*,
+Xbox Series build 1.0.2.1, GDK device SDK version `0x20004`) on ScarlettX, and the emulator features that had to be
+added along the way. The title does **not** run: it now gets through most of its memory and graphics
+initialisation, and stops at a fundamental barrier — its shaders contain native console GPU code instead of
+DXIL bitcode (see [Where it stops](#where-it-stops)).
 
-<!-- SCARLETTX_STATUS_START -->
-## Status
+Everything here is generic emulator code. Nothing from any game (binaries, data, shaders, disassembly dumps) is
+included in this repository.
 
-![ScarlettX Status](docs/status.svg)
+> **Legal notice:** as upstream, this fork contains no proprietary Microsoft/Xbox binaries, keys, firmware or
+> game assets, and it cannot decrypt anything. It only runs titles that are already unencrypted and extracted.
+> Use it only with software you legally own.
 
-![Status of the game Concept Destruction](docs/status_concept_destruction.svg)
+---
 
-| Main menu | In game |
-| :---: | :---: |
-| ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
-| Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
+## Contents
 
-**Emulator Status:** `66.6%` (281 of 422 tracked functions, including unimplemented `0%` subsystems) · **Concept Destruction:** `91.3%` (42 of 46 bring-up milestones) · **Exports:** `269` · **Tests:** `26/26` passing · **Target:** `Xbox Series X|S (Gen9)`
+- [Status at a glance](#status-at-a-glance)
+- [What was added](#what-was-added)
+  - [Xbox physical page memory (`xmem`)](#1-xbox-physical-page-memory-xmem)
+  - [Unified memory: GPU access to title memory](#2-unified-memory-gpu-access-to-title-memory)
+  - [Descriptor heaps placed at title addresses](#3-descriptor-heaps-placed-at-title-addresses)
+  - [New / fixed `d3d12_xs` device and command-list slots](#4-new--fixed-d3d12_xs-device-and-command-list-slots)
+  - [PC D3D12 validity fixes](#5-pc-d3d12-validity-fixes)
+  - [Diagnostics](#6-diagnostics)
+- [Bring-up log: how far the title gets](#bring-up-log-how-far-the-title-gets)
+- [Where it stops](#where-it-stops)
+- [Assumptions and known shortcuts](#assumptions-and-known-shortcuts)
+- [Building](#building)
+- [Running and environment variables](#running-and-environment-variables)
+- [Changed files](#changed-files)
 
-| Subsystem | Category | Progress | Coverage | Details |
-| :--- | :--- | :---: | :---: | :--- |
-| **PE64 Loader & Auto-Stubs** | `Core` | `6 of 6` | `100%` | PE32+ mapping, DIR64/HIGHLOW relocs, named/ordinal IAT, API-set redirection, x64 auto-stub thunks |
-| **d3d12_xs → PC D3D12 & PSOs** | `Graphics` | `45 of 46` | `98%` | 44 exports + DXIL/DXBC container parser & Xbox-chunk stripper; root signatures, descriptor heaps, graphics/compute/software-DXR PSOs, pipeline cache, WARP or hardware adapter |
-| **DirectStorage & XVD** | `Storage` | `23 of 24` | `96%` | 22 DStorage exports + unencrypted XVD parser/PackageVfs mounting; async worker queues, fence/status arrays, cancellation, synthetic LZ-RLE test codec |
-| **XTaskQueue & XAsync** | `xgameruntime` | `23 of 24` | `96%` | 15 XTaskQueue + 8 XAsync exports (manual/threadpool/delayed/monitors/cancel) |
-| **Networking (HTTP / XCurl)** | `Networking` | `38 of 40` | `95%` | 19 libHttpClient.GDK + 19 XCurl exports; deterministic offline mock registry, async callbacks, headers, fallback responses |
-| **XSystem & Runtime** | `xgameruntime` | `17 of 18` | `94%` | 17 exports; Scarlett Anaconda device info, runtime/analytics, handle validation |
-| **Input (GameInput)** | `Input` | `15 of 16` | `94%` | 15 exports; virtual Xbox Series controller & keyboard, reading history (Current/Next/Previous), state injection, rumble forwarded to the host controller's two main motors |
-| **DXR / XboxBvhBuilder** | `Graphics` | `12 of 14` | `86%` | 8 BVH exports + DXR AS prebuild/build/destroy, BLAS update, single-ray trace, deterministic software BVH fallback (hardware DXR requires capable GPU) |
-| **Audio (XAudio2 / AcpHal)** | `Media` | `33 of 42` | `79%` | 33 exports (XAudio2_9 ordinal #1 + AcpHal.dll APU/SHAPE shims); headless PCM mixer, WAV writer, fail-closed real-title COM guard, synthetic XMA2 test decoder |
-| **XGameSave (persistent)** | `xgameruntime` | `23 of 30` | `77%` | 23 exports; disk-backed containers, sync/async blob R/W, quota, delete |
-| **XMem & Threading** | `xgameruntime` | `11 of 16` | `69%` | 11 exports; default/custom alloc hooks, VirtualAlloc/Free, time-sensitive thread state |
-| **Middleware (Bink2 / FSR)** | `Middleware` | `22 of 34` | `65%` | 12 Bink2Scarlett + 10 amd_fidelityfx_loader/upscaler_xbox exports; deterministic offline HLE shims (synthetic RGBA/BGRA frames, bilinear upscale & hash) |
-| **XUser & Identity** | `xgameruntime` | `13 of 24` | `54%` | 13 exports; synthetic Xbox Live profile, XUID, gamertag components, privileges |
-| **Hardware DXR & Vulkan Backend** | `Graphics` | `0 of 14` | `0%` | Hardware GPU ray tracing (DXR Tier 1.1) and cross-platform Vulkan / vkd3d-proton backend |
-| **Live Xbox Services (XSAPI/WinRT)** | `Platform` | `0 of 16` | `0%` | Full Xbl* Xbox Live services, WinRT runtime activation, achievements, multiplayer |
-| **Production Codecs (XMA2/GDeflate/Bink)** | `Media` | `0 of 16` | `0%` | Native SHAPE XMA2 transform audio, hardware GDeflate/BCPack, production Bink2 & GPU FSR |
-| **RDNA2 XS2 Shader Lifting** | `Graphics` | `0 of 16` | `0%` | Precompiled RDNA2/Scarlett GPU microcode lifting to PC DXIL or SPIR-V |
-| **Retail XVC/XVD Crypto** | `Storage` | `0 of 12` | `0%` | Encrypted & digitally signed retail .xvc/.xvd package decryption and verification |
-| **Xbox Unified Memory & KernelX** | `Platform` | `0 of 14` | `0%` | MEM_GRAPHICS, 64 KB / 4 MB physical-virtual aliasing, full Game OS kernel services |
+---
 
-> **Not started (0%):** Xbox unified memory (`MEM_GRAPHICS`) & full KernelX, precompiled RDNA2 `XS2` ISA lifting, encrypted retail XVC/XVD decryption, production GDeflate/XMA2/Bink decoding, hardware DXR & Vulkan backend, and live XSAPI/WinRT services. Passing synthetic tests do not imply commercial retail title execution.
+## Status at a glance
 
-_Regenerate with `python tools/generate_status.py --build-dir <build tree>` after adding new HLE APIs or subsystems; the test numbers are read from that tree's last `ctest` run._
-<!-- SCARLETTX_STATUS_END -->
-
-## Architecture Overview
-
-Because Xbox Series X|S executables are native **x86-64 PE32+** binaries targeting Microsoft's Game Development Kit (GDK), ScarlettX focuses on **high-level OS, runtime, memory, and GPU/RT emulation** rather than CPU static recompilation:
-
-| Subsystem | Components | Status |
+| Area | Before this fork | Now |
 | :--- | :--- | :--- |
-| **Package & PE64 Loader** | `MicrosoftGame.Config` parser (`XboxGen9`/`Scarlett`), in-process PE64 mapper (`DIR64`/`HIGHLOW` relocations, page protections), named/ordinal IAT & API-set resolution (`api-ms-win-core-synch-l1-2-*`, `rtlsupport`, `psm-appnotify`), dynamic `LoadLibrary` shim redirection, x64 auto-stub thunk generator | Phase 1 updated + tests |
-| **GDK Runtime (`xgameruntime.dll`)** | C ABI for `XGameRuntime*`, `XTaskQueue*`, `XAsync*`, `XUser*`, persistent disk-backed `XGameSave*`, `XSystem*`, `XMem*` hooks & virtual memory, `XThread*`, `XStorage`, `InitializeApiImpl`/`InitializeApiImplEx`, `UninitializeApiImpl`, `XErrorReport`, plus ScarlettX-owned guest COM vtables for `QueryApiImpl` GUIDs `{073B7DCB-1FCF-4030-94BE-E3C9EB623428}` and `{37E56907-2F10-41E8-B72F-36EDB185331A}` | Phase 3 updated + tests |
-| **Graphics (`d3d12_xs` / `xg_xs`)** | `d3d12_xs.dll` (`D3D12XboxCreateDevice`, `D3D12XboxSetProcessDebugFlags`, `D3D12SerializeRootSignature`, `D3D12XboxCreateSyntheticDevice`, ScarlettX-owned Xbox COM proxy wrappers for device, queues `0x2`/`0x10`, fences, descriptor heaps, allocators, root signatures, graphics PSOs, resources, command lists, and frame events) + `xg_xs.dll` (`XGCreateTexture2DComputer`, `XGComputeOptimalSwizzleMode`) | Phase 3 in progress + tests |
-| **Ray Tracing (DXR / BVH)** | Synthetic `d3d12_xs` DXR acceleration-structure prebuild/build/destroy + `XboxBvhBuilder.dll` (synthetic signatures + deterministic software BVH fallback; hardware DXR requires a DXR-capable GPU) | Synthetic scaffold + tests |
-| **DirectStorage & XVD (`dstorage_xs.dll`)** | Renamed to Xbox `dstorage_xs.dll`; async worker-thread I/O queues, file/memory/XVD reads, fence callbacks, status arrays, cancellation by tag, synthetic LZ-RLE test codec, unencrypted XVD container parser + `PackageVfs::MountXvd` | Phase 1 cleanup + tests |
-| **Audio (`xaudio2_9.dll` / `AcpHal.dll`)** | `XAudio2_9.dll` with verified ordinal `#1` (`XAudio2Create`; real titles get guest-facing `IXAudio2`/voice objects over the host XAudio2 2.9, or silent output without an audio device; effect chains are not passed through) + `AcpHal.dll` (`ApuAlloc`/`ApuFree`/`ApuMapVirtualAddress`/`ApuIsVirtualAddressValid`/`AcpHalCreate`/`AcpHalAllocateShapeContexts`/`AcpHalReleaseShapeContexts`) + headless PCM mixer & synthetic XMA2 test decoder | Phase 3 updated + tests |
-| **Input (`GameInput.dll`)** | `GameInput.dll` with verified ordinal `#1` (`GameInputCreate`), virtual Xbox Series controller & keyboard enumeration, reading history (`Current`/`Next`/`Previous`), deterministic input injection, rumble forwarded to the host controller's two main motors | Phase 1 updated + tests |
-| **Shader & PSO Pipeline** | DXIL/DXBC container parser (stage, shader model, I/O params, RT exports, embedded root sig, content hash), Xbox-private chunk stripping (`XBOX`/`XS2M`), explicit unsupported-format error on precompiled RDNA2 `XS2`, D3D12 root signatures, descriptor heaps, graphics/compute/software-DXR PSOs, pipeline cache stats, draw/dispatch/RT command execution | Synthetic scaffold + tests |
-| **Middleware (`Bink2` / `FidelityFX`)** | `Bink2Scarlett.dll` (open/decode/advance/pause/seek/RGBA/BGRA/summary), `amd_fidelityfx_loader_xbox.dll` & `amd_fidelityfx_upscaler_xbox.dll` (context lifecycle, quality ratios, render resolution, jitter, deterministic bilinear upscale & frame hash) | Synthetic scaffold + tests |
-| **Networking (`libHttpClient` / `XCurl`)** | `libHttpClient.GDK.dll` (init, mock registry, request setup, async callbacks, offline fallback), `XCurl.dll` (easy handle lifecycle, `curl_easy_setopt`, write callbacks, `curl_easy_getinfo`, slist headers, mock/offline responses) | Synthetic scaffold + tests |
-| **End-to-End Integration** | `scarlett_arena` synthetic Gen9 game booting via in-process PE64 mapper (with isolated guest `atexit` cleanup) and child process across `xgameruntime`, `dstorage_xs`/XVD, `GameInput`, `d3d12_xs` + software BVH RT, `XAudio2`, and `XGameSave` | Synthetic E2E + tests |
+| `xmem.dll` physical page API | stubs (title asserts on first call) | implemented on host placeholders + pagefile sections |
+| `MEM_RESERVE_PLACEHOLDER` / `MEM_REPLACE_PLACEHOLDER` via `XMemVirtualAlloc` | passed to `VirtualAlloc` → fails | routed to `VirtualAlloc2`, tracked |
+| `PAGE_GRAPHICS_*` protections | passed through → `VirtualAlloc` fails | translated to host protections |
+| GPU buffers over title memory | separate host copy only | same physical pages as the CPU (placed on the backing section) |
+| Title GPU virtual addresses in CBVs / root views / IA views | passed through (invalid on PC) | translated; GPU views of title memory created on demand |
+| Descriptor heaps at a title-chosen address | host address returned → title asserts | title address returned, all handles translated |
+| Command-list vtable | 96 slots (title calls slots 131/132 → jumps through unrelated memory) | 256 slots, unknown slots logged |
+| Device vtable | 128 slots (title calls slot 133 → null call) | 256 slots, slots 61/74/86/127/133 implemented |
+| Device removal (`DXGI_ERROR_INVALID_CALL`) during init | yes | fixed (CBV size, >2 GB resources, oversized UAV) |
+| Title shaders | — | **not loadable**: DXIL containers with native GPU code (`XDAT`) instead of bitcode |
 
-### Real-Title Bring-Up (Verified Observations — Concept Destruction)
+The upstream test suite (26 tests) still passes with all changes.
 
-Testing against an unencrypted commercial Xbox Series X|S (`Scarlett`) Unity IL2CPP title (**Concept Destruction**, kept strictly outside the repository) established:
+---
 
-- **Phase 1 — Static inspection & image mapping:** PE64 image maps with 405 imported symbols and no auto-stubs left; ScarlettX's `d3d12_xs.dll`, `xg_xs.dll`, and `AcpHal.dll` resolve all static Xbox imports.
-- **Phase 2 — `QueryApiImpl` COM interface (`{073B7DCB-1FCF-4030-94BE-E3C9EB623428}`):** Reverse-engineered the target's Windows x64 register ABI (`RCX=api_id`, `RDX=riid`, `R8=out_impl`) and vtable offsets (`+0x00`/`+0x08`/`+0x10`, `+0x30`, `+0x60`, `+0x80`, `+0x88`, `+0xE8`). Implemented a ScarlettX-owned 32-slot guest COM object in `xgameruntime.dll` with dedicated ABI tests (`test_query_api_impl`).
-- **Phase 3 — Runtime tables, `AcpHal` and `d3d12_xs` proxies:** every `QueryApiImpl` table the title requests now resolves through ScarlettX-owned guest COM objects (task queues, XNetworking, XGame, XSystem, XUser, XGameSave). Table slots were identified from the console `xgameruntime.dll`; slots without a verified name stay unnamed and traced. `XUserGetTokenAndSignatureAsync` still returns `E_NOTIMPL`; the title carries on.
-- **Phase 4 — Frames:** with guest implicit TLS in the loader the title runs until stopped. It writes cooked texel data (console `4KB_S` layout) to the address returned by `ID3D12Resource::GetGPUVirtualAddress`; `d3d12_xs` backs that address with guest memory and converts it into the host texture, `xg_xs` reports the console texture layout, and scene textures are created through `CreateHeap`/`CreatePlacedResource`. Frame dumps show, in order: the publisher logo, the developer logo, the intro cutscene, a 3D scene, the main menu and the "Select car" menu.
-- **Phase 5 — Input, gameplay, audio:**
-  - With keyboard input bridged to a virtual gamepad, a Championship event starts and the car drives. Verified in frame dumps: A, B, D-pad, left stick, right trigger. A real Xbox controller works as well, and progress is saved: a championship in progress continued after the emulator was restarted.
-  - `XAudio2Create` returns guest-facing objects; the title creates its engine, mastering voice and a 48 kHz source voice and polls the play position, against a silent output (the first test machine has no audio device). On a machine with an audio device the title's sound is audible.
-  - No `CmdList::Close` failure or device removal in gameplay runs.
-  - On a hardware GPU (`--gpu`) the title plays at full speed: about 110 fps at 2,300 draw calls per frame and about 140 fps at 850, measured with `--stats`. An event ran from the countdown to the results screen. The software rasterizer of the first test machine managed about 2 to 3 fps.
-- **Known problems:** The fps figures in this README were measured before frame pacing existed; `--fcap 0` gives the same behaviour.
-- **Current classification:** **In-game** — **Concept Destruction** and **Unicorn Overlord** are playable on a hardware GPU; Alt+Enter toggles borderless fullscreen and controller rumble works.
+## What was added
 
-### Current Limitations
+### 1. Xbox physical page memory (`xmem`)
 
-- **Xbox COM vtable wrappers:** `d3d12_xs` guest-facing proxies cover what **Concept Destruction** and **Unicorn Overlord** use; other titles will hit unimplemented or unnamed slots. `XAudio2Create` returns guest-facing `IXAudio2`, source, submix and mastering voice objects (never a host COM pointer); they forward to the host XAudio2 2.9, or to a silent output when the host has no audio device. With the real title the sound is audible through the host output; effect chains are not passed to the host, and the silent output times every buffer as PCM.
-- **Presentation:** Alt+Enter switches the PresentX window to borderless fullscreen on its monitor and back, stretching the title's frame; there is no exclusive fullscreen. `WaitFrameEventX` waits for the next frame origin at the interval set with `SetFrameIntervalX`, on a timer rather than the display's vertical sync; `ScheduleFrameEventX` succeeds without scheduling anything.
-- **Guest texture uploads:** texel data a title writes to a texture's address is uploaded once per presented frame, before the frame's first submit, so a later write reaches the host texture one frame late. Until the first frame is presented, every submit uploads.
-- **Child-process boot:** without `--in-process` the guest starts as a separate process. The emulator sets the shim directory as the DLL directory for that process, so the shims are found ahead of a host `C:\Windows\System32\xgameruntime.dll` (a Windows component on some Windows 11 builds). A DLL of the same name next to the guest executable still takes precedence over the shim.
-- **Unimplemented 0% subsystems:** Xbox unified memory (`MEM_GRAPHICS`, 64 KB / 4 MB physical-virtual aliasing) & full KernelX, precompiled RDNA2 `XS2` ISA lifting, encrypted retail `.xvc`/`.xvd` decryption, production GDeflate/BCPack/XMA2/Bink2/GPU FSR codecs, hardware DXR Tier 1.1 & Vulkan backend, and live XSAPI/WinRT services.
-- **Codecs, Middleware & Networking:** `Bink2Scarlett`, `amd_fidelityfx_*_xbox`, `dstorage_xs` decompression, `XMA2`, `libHttpClient.GDK`, and `XCurl` use deterministic offline/synthetic HLE shims for automated tests. Passing synthetic tests do not imply commercial retail title execution.
+New file: [`src/shims/xmem_physical.cpp`](src/shims/xmem_physical.cpp) (exported from `xgameruntime.dll`, to which
+`xmem.dll` is redirected).
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md) for detailed design notes.
+The console `xmem.dll` exposes an AWE-style API: a title allocates 64 KB *physical pages*, gets page frame numbers
+back, and maps them into address ranges it reserved itself — often several of them, and often the same pages
+twice. The signatures were recovered from a retail title's call sites (they are not public):
 
-## Building & Running Tests
+```c
+BOOL  XMemAllocatePhysicalPages(ULONG flags, ULONG_PTR* count, ULONG_PTR* pageArray);
+BOOL  XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* pageArray);
+void* XMemMapPhysicalPages(void* va, ULONG_PTR count, ULONG_PTR* pageArray);      // pageArray == NULL unmaps
+BOOL  XMemMapPhysicalPagesScatter(void** vas, ULONG_PTR count, ULONG_PTR* pageArray);
+BOOL  XMemGetWorkingSetStatistics(ULONG flags, void* stats);
+BOOL  XMemIsToolsMemAvailable(void);
+BOOL  XMemTransferMemory(ULONG direction, SIZE_T size);
+```
 
-Requirements on Windows (x86-64):
-- CMake 3.20+
-- Ninja
-- C++20 compiler (MinGW-w64 GCC 13+ or MSVC 2022)
-- Windows D3D12 runtime + WARP (included in Windows 10/11 & Server 2022)
+Implementation:
 
-```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+- Every `XMemAllocatePhysicalPages` call is backed by one pagefile-backed section (`CreateFileMapping`,
+  `SEC_COMMIT`). A PFN indexes a table of *(section, offset)*.
+- 64 KB / 2 MB reservations made through `XMemVirtualAlloc` become **host placeholders** (`VirtualAlloc2` +
+  `MEM_RESERVE_PLACEHOLDER`). A page is mapped by splitting a 64 KB placeholder out of the range and replacing it
+  with a view of the right section offset (`MapViewOfFile3` + `MEM_REPLACE_PLACEHOLDER`). Unmapping puts the
+  placeholder back (`UnmapViewOfFile2` + `MEM_PRESERVE_PLACEHOLDER`). Commits into such a range are handled the
+  same way (`VirtualAlloc2` + `MEM_REPLACE_PLACEHOLDER`).
+- Titles also build these layouts *themselves*: `XMemVirtualAlloc(NULL, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER)`,
+  split it with `VirtualFree(MEM_PRESERVE_PLACEHOLDER)`, then turn parts into reservations with
+  `XMemVirtualAlloc(part, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER)`. The first now goes through `VirtualAlloc2`; the
+  second keeps the part a host placeholder (so pages can still be mapped into it) and adopts it as an XMem
+  reservation.
+- **Contiguity-preserving slot assignment.** A page only gets its offset in the section when it is first mapped.
+  If it is mapped inside a title placeholder reservation, it gets the slot matching its position in that
+  reservation. A title that maps one allocation's pages over a reservation of the same size in several pieces, in
+  any order, therefore ends up with one contiguous run in the section — which is what makes a single GPU resource
+  over it possible (next section).
+- `PAGE_GRAPHICS_*` protections (`0x800`–`0x40000`, sometimes OR'ed with a plain `PAGE_*`) are translated to host
+  protections in `XMemVirtualAlloc`.
+
+Two helper exports (not console API) let `d3d12_xs.dll` ask what backs a range:
+`ScxXMemQueryBacking` / `ScxXMemQueryBackingSparse` (runs of *section, offset, va, length*) and `ScxXMemRegionOf`.
+
+Set `SCARLETTX_XMEM_TRACE=1` to log reservations, allocations and mappings.
+
+### 2. Unified memory: GPU access to title memory
+
+On the console, CPU and GPU share one address space: a buffer's GPU virtual address *is* its CPU address, and
+titles write constant data, vertices, etc. through plain pointers and hand the same pointers to the GPU.
+
+- **Device slot 133 (`+0x428`) — `CreatePlacedResourceX(address, desc, initialState, clearValue, riid, ppv)`**:
+  a resource created at a title address. For buffers over physical-page memory the backing section is opened as a
+  D3D12 heap (`OpenExistingHeapFromFileMapping`) and the buffer is placed at the matching section offset, so the GPU
+  reads exactly what the CPU wrote. Other cases fall back to `OpenExistingHeapFromAddress` (only when the host
+  allocation is large enough) and finally to a separate committed resource.
+- **GPU virtual address translation.** Title addresses are translated to host GPU virtual addresses in
+  `CreateConstantBufferView`, `Set{Graphics,Compute}Root{ConstantBuffer,ShaderResource,UnorderedAccess}View`,
+  `IASetVertexBuffers` and `IASetIndexBuffer`.
+- **On-demand GPU views.** An address that is not inside a known buffer is resolved lazily: plain title
+  allocations (`MEM_PRIVATE`) are wrapped with `OpenExistingHeapFromAddress`; physical-page views (`MEM_MAPPED`)
+  get one placed buffer per contiguous section run of their XMem reservation.
+- Ranges over 1 GB are covered by **1 GB buffers every 512 MB** (D3D12 resources are limited to 2 GB; views on
+  larger ones remove the device), so any view of up to 512 MB lies inside one buffer.
+- Device slot 74 (`+0x250`) — `CreateHeapFromPhysicalPagesX(address, numPages64K, ppHeap)` returns a heap proxy
+  of the right size (like `CreateHeap` in this layer, it does not alias the title memory).
+
+Tiled (reserved) resources were tried for ranges made of several section runs, but `UpdateTileMappings` does not
+accept cross-adapter (file-mapping) heaps, so that path was removed.
+
+### 3. Descriptor heaps placed at title addresses
+
+The console `D3D12_DESCRIPTOR_HEAP_DESC` carries two extra fields: a placement address (`+0x10`) and a size in
+bytes (`+0x18`). The title then requires `GetCPUDescriptorHandleForHeapStart()` to return *that* address.
+
+- Such heaps are registered with their title range; `GetCPU/GPUDescriptorHandleForHeapStart` return the title
+  address.
+- Every incoming descriptor handle is translated to the host heap: `Create{CBV,SRV,UAV,RTV,DSV,Sampler}`,
+  `CopyDescriptors`, `CopyDescriptorsSimple`, `OMSetRenderTargets`, `Clear{RenderTarget,DepthStencil}View`,
+  `Set{Graphics,Compute}RootDescriptorTable`.
+- Shader-visible CBV/SRV/UAV heaps larger than the PC limit (the title asks for 1,245,184 descriptors) are clamped
+  to 1,000,000 (samplers to 2,048).
+
+### 4. New / fixed `d3d12_xs` device and command-list slots
+
+| Interface | Slot (offset) | Meaning (as identified) | Status |
+| :--- | :--- | :--- | :--- |
+| Device | 61 (`+0x1e8`) | create sampler from an 0x54-byte console sampler desc | implemented; layout partly inferred, fields used only when valid |
+| Device | 74 (`+0x250`) | heap over physical-page memory | implemented (proxy only) |
+| Device | 86 (`+0x2b0`) | `ID3D12Device2::CreatePipelineState` (stream) — identified by `IID_ID3D12PipelineState` | implemented: stream walked, root signatures replaced, passed to host |
+| Device | 127 (`+0x3f8`) | `ID3D12Device10::CreateCommittedResource3` (initial *layout*) | implemented: layout mapped to a legacy state |
+| Device | 133 (`+0x428`) | `CreatePlacedResourceX` (resource at a title address) | implemented (see above) |
+| Device | 70 (`+0x230`) | unknown, writes a descriptor (return value ignored by the title) | logged only |
+| Command list | 131 / 132 (`+0x418` / `+0x420`) | unknown console methods (register-like writes, mask `0xffffffffff00`) | logged only |
+| Command signature | argument type `105` (12-byte stride) | console-only indirect argument | **assumed** to be a mesh dispatch |
+
+The device and command-list vtables were enlarged to 256 slots: retail titles call methods past the old table
+ends, which made those calls jump through whatever memory followed the table. Unknown slots are now logged with
+their arguments and the caller's address (`ret=` is now the raw return address, which matches a disassembly of
+the title directly since titles are mapped at their preferred base).
+
+### 5. PC D3D12 validity fixes
+
+Each of these removed the device (`DXGI_ERROR_INVALID_CALL`) or crashed the driver:
+
+- **CBV sizes** must be multiples of 256 bytes on PC; consoles accept e.g. 128. Sizes are rounded up.
+- A UAV over a buffer that had been clamped to the host allocation size ran past its end — buffers are no longer
+  shrunk; they are made to cover the real range (or fall back to a committed resource).
+- Resources over 2 GB (see the 1 GB / 512 MB chunking above).
+- A command-list call through the too-short vtable forwarded garbage (`root parameter 0x700000`, null table)
+  to the driver; `SetGraphicsRootDescriptorTable` now also ignores parameter indices ≥ 64 and null tables.
+
+### 6. Diagnostics
+
+New file: [`src/runtime/guest_breakpoints.cpp`](src/runtime/guest_breakpoints.cpp), armed right before the guest
+entry point, plus extra reporting in `d3d12_xs`:
+
+| Variable | Effect |
+| :--- | :--- |
+| `SCARLETTX_CRASH_LOG=1` | logs access violations and the title's own `int3` checks with registers and an unwound call stack (module names, title frames marked `title`) |
+| `SCARLETTX_BREAKPOINTS=0x…,0x…` | software breakpoints at any address (title or host DLL); each hit logs registers and the call stack, then single-steps and re-arms |
+| `SCARLETTX_BREAKPOINT_HITS=N` | log lines per breakpoint (default 4) |
+| `SCARLETTX_SKIP_INT3=0x…,0x…` | steps over the listed `int3` instructions of the title (consistency checks known to be harmless under emulation) |
+| `SCARLETTX_DRED=1` | enables D3D12 DRED (auto-breadcrumbs, page faults) and prints them when device removal is detected |
+| `SCARLETTX_D3D12_DEBUG=1` | debug layer (upstream); stored messages are now printed at failure points |
+| `SCARLETTX_D3D12_BREAK=1` | with the debug layer: break on the first error/corruption message |
+| `SCARLETTX_DUMP_SHADERS=<dir>` | writes the first shaders passed to `CreatePipelineState` to `<dir>` and logs their container parts |
+| `SCARLETTX_XMEM_TRACE=1` | XMem reservation / physical page trace |
+
+Device removal is also checked after every device call that can trigger it, and the first call after which the
+device is found removed is named in the log (`DEVICE REMOVED (…) first seen after …`).
+
+---
+
+## Bring-up log: how far the title gets
+
+In order, with the fix that got past each point:
+
+1. `XMemVirtualAlloc` with `PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS` failed → protection translation.
+2. `XMemAllocatePhysicalPages` was a stub → physical page API.
+3. DirectStorage factory and all 12 data archives open (already worked upstream once memory was fixed).
+4. D3D12 device created on the host GPU; command queues, fences, allocators, command lists created.
+5. First command list calls slots 131/132 past the vtable end → vtable enlarged.
+6. Graphics init failed on `MEM_RESERVE_PLACEHOLDER` → placeholder support in `XMemVirtualAlloc`.
+7. Null call through device slot 133 → `CreatePlacedResourceX`.
+8. Shader-visible heap of 1,245,184 descriptors rejected → clamp.
+9. Descriptor heap must sit at the title's address → placed heaps + handle translation.
+10. Device removed by a UAV past the end of a too-small buffer → buffers over the physical-page sections.
+11. Device slot 127 → `CreateCommittedResource3`; two 3840×2160 display buffers, SRVs and RTVs created.
+12. A memory-budget consistency check (`int3`) fails because back buffers get committed memory → skipped
+    with `SCARLETTX_SKIP_INT3`.
+13. Command signature with console argument type 105 → mapped to mesh dispatch.
+14. Device slot 74 (heap over a ~6 GB physical page range) → heap proxy.
+15. Device removed after `CreateCBV` → title CPU addresses translated to GPU addresses, CBV size rounded to 256.
+16. Device slots 61 (samplers) and 86 (`CreatePipelineState`) implemented.
+17. **`CreatePipelineState` is rejected by the host** → see below.
+
+Frame pacing is set up by the title at this point (`SetFrameIntervalX(33333 µs)`, i.e. 30 FPS); no frame is
+submitted or presented yet.
+
+## Where it stops
+
+The title's pipeline state streams parse cleanly (all subobjects understood, root signatures replaced), but the
+host runtime rejects them. Dumping the shaders (`SCARLETTX_DUMP_SHADERS`) shows DXBC containers with the usual
+parts:
+
+```
+magic='DXBC'  parts: SFI0 ISG1 OSG1 PSV0 HASH DXIL PRIV
+DXIL part:    program version 0x00010066 (vs_6_6), DXIL 1.6, bitcode size 4 bytes, followed by an 'XDAT' block
+```
+
+The `DXIL` part has a valid header but **no LLVM bitcode** — only a 4-byte stub followed by a console-specific
+`XDAT` block, presumably the pre-compiled native GPU (RDNA2) code. The official validator (`dxv`) reports
+`Invalid bitcode signature`. There is nothing a PC driver could compile.
+
+Running such titles would need a **console GPU ISA → DXIL recompiler**, comparable to the shader translators of
+mature console emulators — far beyond a bring-up fix. After that would still come console texture layouts,
+`XboxBvhBuilder` ray tracing, the audio hardware APIs (`XApu`, `XDsp` / `chad.dll`), Bink video and the rest of
+rendering.
+
+## Assumptions and known shortcuts
+
+Things that are guesses or deliberate shortcuts, so they are easy to revisit:
+
+- **Indirect argument type 105** is mapped to `D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH` because of its 12-byte
+  stride. Not verified.
+- **Sampler desc layout** (device slot 61) is inferred from the code that fills it; only fields within valid PC
+  ranges are used, the rest is defaulted (linear, wrap).
+- **`CreateCommittedResource3`** layouts are converted to legacy resource states, since the rest of the layer uses
+  legacy barriers.
+- **Heap from physical pages** (slot 74) and resources placed in it do not alias the title's memory.
+- **Shader-visible heaps are clamped** to 1,000,000 descriptors; title handles past that point would be invalid.
+- `XMemGetWorkingSetStatistics` returns success with an all-zero block (layout unknown);
+  `XMemIsToolsMemAvailable` and `XMemTransferMemory` return `TRUE`.
+- Freed physical pages keep their section slot (no slot reuse yet).
+- `SCARLETTX_SKIP_INT3` steps over checks of the title. Use only for checks understood to be emulation artefacts.
+- With the D3D12 debug layer on, the title takes a different (slower) path and exits on its own earlier, so most
+  of the work above was done with DRED and the removal checks instead.
+
+## Building
+
+Requirements: Windows 10/11 x64, CMake ≥ 3.20, Ninja, a C++20 compiler. Tested with portable
+[WinLibs](https://winlibs.com/) GCC 16.2 (MinGW-w64 UCRT), CMake 4.5 and Ninja 1.13:
+
+```powershell
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-## Running the Synthetic Scarlett Test Games
+MSVC 2022 should work as upstream documents, but was not tested with these changes.
 
-```bash
-# Inspect a Game Core package manifest and PE imports
-./build/scarlettx inspect build/packages/hello_scarlett
+## Running and environment variables
 
-# Boot the synthetic hello_scarlett title headlessly
-./build/scarlettx boot build/packages/hello_scarlett --headless --frames 3
+As upstream, point `boot` at an extracted, unencrypted title folder (the one holding `MicrosoftGame.config`):
 
-# Boot the synthetic ray-tracing showcase and dump a rendered RT frame
-./build/scarlettx boot build/packages/rt_showcase --headless --frames 2 --rt-dump rt_frame.ppm
-
-# Run the full-stack end-to-end synthetic game demo (PE64 + XVD/DirectStorage + GameInput + D3D12/BVH RT + XAudio2/XMA2 + XGameSave)
-./build/test_scarlett_arena_e2e
+```powershell
+$env:SCARLETTX_TRACE     = "1"
+$env:SCARLETTX_CRASH_LOG = "1"
+$env:SCARLETTX_DRED      = "1"
+.\build\scarlettx.exe boot "D:\Titles\SomeTitle" --in-process --gpu --trace
 ```
 
-## Running a Real Title
+See [Diagnostics](#6-diagnostics) for the variables added in this fork, and `UPSTREAM_README.md` for the rest
+(`--warp`, `--fcap`, input mapping, save location).
 
-```bash
-# From the directory that holds scarlettx.exe and the shim DLLs
-scarlettx boot "<extracted package>\Mount" --in-process --gpu --stats
-```
+## Changed files
 
-- `--in-process` maps the title into the emulator process (the path used for real titles). `--gpu` renders on the hardware adapter, which is the default; `--warp` selects the software rasterizer. `--stats` prints fps and D3D12 call counts once per second, `--fcap N` holds N frames per second instead of the title's own rate (for example `--fcap 144`; `--fcap 0` removes the cap), and `--trace` logs the shim calls.
-- Input: the keyboard while the window has focus (arrows = D-pad, WASD = left stick, IJKL = right stick, Enter/Space = A, Escape/Backspace = B, X = X, Y = Y, Q/E = shoulders, 1/3 = triggers, Tab = View, P = Menu), and the first XInput controller when one is connected (checked with an Xbox controller; rumble is forwarded to it).
-- The window does not close from its title bar; stop the emulator with Ctrl+C in its console.
-- Save data goes to `%TEMP%\scarlettx_saves`; set `SCARLETTX_SAVE_ROOT` to use another directory.
+| File | Change |
+| :--- | :--- |
+| `src/shims/xmem_physical.cpp`, `.h` | **new** — physical page API, placeholder management, backing queries |
+| `src/shims/xgameruntime_shim.cpp` | `XMemVirtualAlloc`: graphics protections, placeholder reserve/replace, commits into placeholder ranges |
+| `src/shims/d3d12_xs_shim.cpp` | placed descriptor heaps, handle and GPU VA translation, GPU views of title memory, slots 61/74/86/127/133, 256-slot vtables, CBV/heap/size fixes, DRED, info-queue dumps, removal checks, shader dumping |
+| `src/runtime/guest_breakpoints.cpp`, `.h` | **new** — crash log, breakpoints, `int3` skipping, stack unwinding |
+| `src/runtime/emulator.cpp` | arms the diagnostics before the guest entry point |
+| `CMakeLists.txt` | new sources |
+| `UPSTREAM_README.md` | the original README, unchanged (renamed) |
+
+---
+
+*The changes in this fork were made with the help of [Claude Code](https://claude.com/claude-code).*

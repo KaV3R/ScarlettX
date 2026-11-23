@@ -6,6 +6,7 @@
 
 #include "scarlettx/loader/pe_mapper.h"
 #include "scarlettx/runtime/virtual_drive.h"
+#include "guest_breakpoints.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -171,6 +172,7 @@ Status Emulator::BootPackage(const std::string& package_dir) {
             SetCurrentDirectoryA(drive_mapped ? "G:\\" : abs_pkg_dir.c_str());
             std::cout << "[ScarlettX][loader] Entering native PE entry point at "
                       << image.EntryPointAddress() << std::endl;
+            InstallGuestBreakpointsFromEnv();
             call_st = image.CallEntryPoint(exit_code);
         }
         if (!call_st.ok()) {

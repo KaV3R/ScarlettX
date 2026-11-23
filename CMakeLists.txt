@@ -25,6 +25,7 @@ add_library(scarlettx_core STATIC
     src/gpu/shader_ir.cpp
     src/gpu/xg_layout.cpp
     src/runtime/emulator.cpp
+    src/runtime/guest_breakpoints.cpp
     src/runtime/virtual_drive.cpp
 )
 
@@ -81,7 +82,8 @@ target_compile_definitions(AcpHal PRIVATE SCARLETTX_BUILDING_ACPHAL=1)
 add_library(xgameruntime SHARED
     src/shims/xgameruntime_shim.cpp
     src/shims/xgr_api_tables.cpp
-    src/shims/xgr_task_queue.cpp)
+    src/shims/xgr_task_queue.cpp
+    src/shims/xmem_physical.cpp)
 set_target_properties(xgameruntime PROPERTIES PREFIX "" OUTPUT_NAME "xgameruntime")
 target_link_libraries(xgameruntime PRIVATE scarlettx_core)
 target_compile_definitions(xgameruntime PRIVATE SCARLETTX_BUILDING_XGAMERUNTIME=1)

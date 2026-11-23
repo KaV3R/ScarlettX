@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <map>
 #include <mutex>
 #include "scarlettx/gpu/xg_layout.h"
 #include <sstream>
@@ -208,6 +209,78 @@ bool TraceEnabled() {
     }();
     return enabled;
 }
+
+#if defined(_WIN32)
+// Prints and clears the debug layer's stored messages (SCARLETTX_D3D12_DEBUG=1).
+void DumpD3D12InfoQueue(ID3D12Device* dev, const char* where) {
+    if (!dev) return;
+    ID3D12InfoQueue* q = nullptr;
+    if (FAILED(dev->QueryInterface(__uuidof(ID3D12InfoQueue), reinterpret_cast<void**>(&q))) || !q) return;
+    const UINT64 n = q->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n && i < 64; ++i) {
+        SIZE_T len = 0;
+        if (FAILED(q->GetMessage(i, nullptr, &len)) || !len) continue;
+        std::vector<char> buf(len);
+        auto* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+        if (SUCCEEDED(q->GetMessage(i, m, &len)) && m->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+            std::cerr << "[ScarlettX][d3d12-debug][" << where << "] sev=" << static_cast<int>(m->Severity)
+                      << " id=" << static_cast<int>(m->ID) << ": "
+                      << std::string(m->pDescription, m->DescriptionByteLength ? m->DescriptionByteLength - 1 : 0)
+                      << "\n";
+        }
+    }
+    q->ClearStoredMessages();
+    q->Release();
+}
+
+// Logs (once) the first call after which the device is found removed.
+void CheckDeviceRemoved(ID3D12Device* dev, const char* where) {
+    static std::atomic<bool> reported{false};
+    if (!dev || reported.load(std::memory_order_relaxed)) return;
+    const HRESULT r = dev->GetDeviceRemovedReason();
+    if (SUCCEEDED(r) || reported.exchange(true)) return;
+    std::cerr << "[ScarlettX][d3d12_xs] DEVICE REMOVED (0x" << std::hex << static_cast<uint32_t>(r) << std::dec
+              << ") first seen after " << where << "\n";
+}
+
+// Prints DRED breadcrumbs (last GPU operations per command list) and the
+// page-fault address, when SCARLETTX_DRED=1 enabled them.
+void ReportDred(ID3D12Device* dev) {
+    ID3D12DeviceRemovedExtendedData* dred = nullptr;
+    if (!dev || FAILED(dev->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData),
+                                           reinterpret_cast<void**>(&dred))) || !dred) {
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
+        int lists = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode; n && lists < 16; n = n->pNext, ++lists) {
+            const UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            if (done >= n->BreadcrumbCount) continue;  // list completed
+            std::cerr << "[ScarlettX][dred] list " << n->pCommandList << " (" << n->BreadcrumbCount
+                      << " ops) stopped after op " << done << ":";
+            for (UINT i = (done > 3 ? done - 3 : 0); i < n->BreadcrumbCount && i < done + 3; ++i) {
+                std::cerr << (i == done ? " [" : " ") << static_cast<int>(n->pCommandHistory[i])
+                          << (i == done ? "]" : "");
+            }
+            std::cerr << "\n";
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf))) {
+        std::cerr << "[ScarlettX][dred] page fault at GPU VA 0x" << std::hex << pf.PageFaultVA << std::dec;
+        int k = 0;
+        for (auto* a = pf.pHeadExistingAllocationNode; a && k < 4; a = a->pNext, ++k) {
+            std::cerr << " existing-alloc-type=" << static_cast<int>(a->AllocationType);
+        }
+        for (auto* a = pf.pHeadRecentFreedAllocationNode; a && k < 8; a = a->pNext, ++k) {
+            std::cerr << " freed-alloc-type=" << static_cast<int>(a->AllocationType);
+        }
+        std::cerr << "\n";
+    }
+    dred->Release();
+}
+#endif
 
 bool RealTitleMode() {
     const char* v = std::getenv("SCARLETTX_REAL_TITLE");
@@ -409,8 +482,98 @@ struct XboxD3D12DescriptorHeapProxy {
 #if defined(_WIN32)
     ID3D12DescriptorHeap* pc_heap = nullptr;
     D3D12_DESCRIPTOR_HEAP_DESC orig_desc{};
+    // Xbox heaps can be placed at a title-chosen address (desc +0x10/+0x18).
+    // Handles then live in the title's range and are translated to the host
+    // heap wherever they come back in.
+    uintptr_t guest_base = 0;
+    uintptr_t guest_size = 0;
 #endif
 };
+
+#if defined(_WIN32)
+struct PlacedDescriptorRange {
+    uintptr_t guest_base, guest_end;
+    SIZE_T host_cpu;
+    UINT64 host_gpu;  // 0 when the heap is not shader visible
+};
+std::mutex g_placed_heaps_mutex;
+std::vector<PlacedDescriptorRange> g_placed_heaps;
+std::atomic<bool> g_have_placed_heaps{false};
+
+void RegisterPlacedDescriptorHeap(uintptr_t base, uintptr_t size, SIZE_T cpu, UINT64 gpu) {
+    std::lock_guard<std::mutex> lock(g_placed_heaps_mutex);
+    g_placed_heaps.push_back({base, base + size, cpu, gpu});
+    g_have_placed_heaps.store(true, std::memory_order_release);
+}
+
+// Title CPU descriptor handle -> host handle (unchanged when not placed).
+SIZE_T HostCpuHandle(uintptr_t h) {
+    if (!g_have_placed_heaps.load(std::memory_order_acquire)) return static_cast<SIZE_T>(h);
+    std::lock_guard<std::mutex> lock(g_placed_heaps_mutex);
+    for (const auto& r : g_placed_heaps) {
+        if (h >= r.guest_base && h < r.guest_end) return r.host_cpu + (h - r.guest_base);
+    }
+    return static_cast<SIZE_T>(h);
+}
+
+// On the console a buffer's GPU virtual address is its CPU address, so titles
+// put their own pointers into CBVs, root views and IA views. Buffers created
+// at a title address (CreatePlacedResourceX) are recorded here with the host
+// resource's GPU address so those pointers can be translated.
+struct GuestGpuRange {
+    uint64_t guest_base, guest_end;
+    D3D12_GPU_VIRTUAL_ADDRESS host_base;
+};
+std::mutex g_gpu_ranges_mutex;
+std::map<uint64_t, GuestGpuRange> g_gpu_ranges;  // keyed by guest_base
+std::atomic<bool> g_have_gpu_ranges{false};
+
+void RegisterGuestGpuRange(uint64_t base, uint64_t size, D3D12_GPU_VIRTUAL_ADDRESS host) {
+    std::lock_guard<std::mutex> lock(g_gpu_ranges_mutex);
+    g_gpu_ranges[base] = {base, base + size, host};
+    g_have_gpu_ranges.store(true, std::memory_order_release);
+}
+
+// Title GPU virtual address -> host GPU virtual address (unchanged when it is
+// not inside a recorded range, e.g. an address the host handed out itself).
+bool LookupGuestGpuVa(uint64_t va, D3D12_GPU_VIRTUAL_ADDRESS* out) {
+    std::lock_guard<std::mutex> lock(g_gpu_ranges_mutex);
+    auto it = g_gpu_ranges.upper_bound(va);
+    if (it == g_gpu_ranges.begin()) return false;
+    --it;
+    if (va >= it->second.guest_end) return false;
+    *out = it->second.host_base + (va - it->second.guest_base);
+    return true;
+}
+
+// Defined with the physical-page GPU helpers further down: creates host
+// buffers over the title memory containing va and records them.
+bool ResolveGuestGpuVa(uint64_t va);
+
+D3D12_GPU_VIRTUAL_ADDRESS HostGpuVa(uint64_t va) {
+    if (!va) return va;
+    D3D12_GPU_VIRTUAL_ADDRESS host = 0;
+    if (g_have_gpu_ranges.load(std::memory_order_acquire) && LookupGuestGpuVa(va, &host)) return host;
+    if (ResolveGuestGpuVa(va) && LookupGuestGpuVa(va, &host)) return host;
+    static std::atomic<int> misses{0};
+    if (TraceEnabled() && misses.fetch_add(1) < 16) {
+        std::cerr << "[ScarlettX][d3d12_xs] GPU VA 0x" << std::hex << va << std::dec
+                  << " is not backed by any GPU-visible title memory\n";
+    }
+    return va;
+}
+
+// Title GPU descriptor handle -> host handle. Placed heaps hand the title
+// its own address as the GPU start too.
+UINT64 HostGpuHandle(uint64_t h) {
+    if (!g_have_placed_heaps.load(std::memory_order_acquire)) return h;
+    std::lock_guard<std::mutex> lock(g_placed_heaps_mutex);
+    for (const auto& r : g_placed_heaps) {
+        if (r.host_gpu && h >= r.guest_base && h < r.guest_end) return r.host_gpu + (h - r.guest_base);
+    }
+    return h;
+}
+#endif
 
 intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12DescriptorHeapProxy*>(self);
@@ -452,6 +615,7 @@ intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyGetCPUStart(void* self, uintptr_t, 
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12DescriptorHeapProxy*>(self);
     if (obj && obj->pc_heap) {
+        if (obj->guest_base) return static_cast<intptr_t>(obj->guest_base);
         const D3D12_CPU_DESCRIPTOR_HANDLE h = obj->pc_heap->GetCPUDescriptorHandleForHeapStart();
         return static_cast<intptr_t>(h.ptr);
     }
@@ -463,6 +627,7 @@ intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyGetGPUStart(void* self, uintptr_t a
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12DescriptorHeapProxy*>(self);
     if (obj && obj->pc_heap) {
+        if (obj->guest_base) return static_cast<intptr_t>(obj->guest_base);
         const D3D12_GPU_DESCRIPTOR_HANDLE h = obj->pc_heap->GetGPUDescriptorHandleForHeapStart();
         if (TraceEnabled()) {
             std::cerr << "[ScarlettX][d3d12_xs] DescHeap::GetGPUStart(self=" << self
@@ -1785,7 +1950,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootDescriptorTable(
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     if (obj->pc_list) {
-        D3D12_GPU_DESCRIPTOR_HANDLE h{static_cast<UINT64>(baseDesc)};
+        D3D12_GPU_DESCRIPTOR_HANDLE h{HostGpuHandle(baseDesc)};
         obj->pc_list->SetComputeRootDescriptorTable(static_cast<UINT>(rootParamIdx), h);
     }
 #endif
@@ -1798,10 +1963,16 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootDescriptorTable(
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     if (TraceEnabled() && n <= 8) {
         std::cerr << "[ScarlettX][d3d12_xs] CmdList::SetGraphicsRootDescTable(#" << n
-                  << ", param=" << rootParamIdx << ", gpu=0x" << std::hex << baseDesc << std::dec << ")\n";
+                  << ", param=" << rootParamIdx << ", gpu=0x" << std::hex << baseDesc
+                  << ", ret=" << __builtin_return_address(0) << std::dec << ")\n";
+    }
+    if (rootParamIdx >= 64 || baseDesc == 0) {
+        // A real root signature has at most 64 parameters; anything else is
+        // a slot mismatch. Forwarding it crashes the host driver.
+        return 0;
     }
     if (obj->pc_list) {
-        D3D12_GPU_DESCRIPTOR_HANDLE h{static_cast<UINT64>(baseDesc)};
+        D3D12_GPU_DESCRIPTOR_HANDLE h{HostGpuHandle(baseDesc)};
         obj->pc_list->SetGraphicsRootDescriptorTable(static_cast<UINT>(rootParamIdx), h);
     }
 #endif
@@ -1856,42 +2027,42 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRoot32BitConstants(
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootCBV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetComputeRootConstantBufferView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) obj->pc_list->SetComputeRootConstantBufferView(static_cast<UINT>(idx), HostGpuVa(loc));
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootCBV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetGraphicsRootConstantBufferView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) obj->pc_list->SetGraphicsRootConstantBufferView(static_cast<UINT>(idx), HostGpuVa(loc));
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootSRV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetComputeRootShaderResourceView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) obj->pc_list->SetComputeRootShaderResourceView(static_cast<UINT>(idx), HostGpuVa(loc));
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootSRV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetGraphicsRootShaderResourceView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) obj->pc_list->SetGraphicsRootShaderResourceView(static_cast<UINT>(idx), HostGpuVa(loc));
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootUAV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetComputeRootUnorderedAccessView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) obj->pc_list->SetComputeRootUnorderedAccessView(static_cast<UINT>(idx), HostGpuVa(loc));
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootUAV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetGraphicsRootUnorderedAccessView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) obj->pc_list->SetGraphicsRootUnorderedAccessView(static_cast<UINT>(idx), HostGpuVa(loc));
 #endif
     return 0;
 }
@@ -1906,7 +2077,13 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListIASetIndexBuffer(void* self, uintptr_t pV
                   << ", size=" << ib->SizeInBytes << ", fmt=" << ib->Format << ")\n";
     }
     if (obj->pc_list) {
-        obj->pc_list->IASetIndexBuffer(reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(pView));
+        if (pView) {
+            D3D12_INDEX_BUFFER_VIEW ib = *reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(pView);
+            ib.BufferLocation = HostGpuVa(ib.BufferLocation);
+            obj->pc_list->IASetIndexBuffer(&ib);
+        } else {
+            obj->pc_list->IASetIndexBuffer(nullptr);
+        }
     }
 #endif
     return 0;
@@ -1924,9 +2101,14 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListIASetVertexBuffers(
                   << ", size=" << vb[0].SizeInBytes << ", stride=" << vb[0].StrideInBytes << "))\n";
     }
     if (obj->pc_list) {
-        obj->pc_list->IASetVertexBuffers(
-            static_cast<UINT>(startSlot), static_cast<UINT>(numViews),
-            reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(pViews));
+        const auto* gv = reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(pViews);
+        std::vector<D3D12_VERTEX_BUFFER_VIEW> views(gv ? static_cast<size_t>(numViews) : 0);
+        for (size_t i = 0; i < views.size(); ++i) {
+            views[i] = gv[i];
+            views[i].BufferLocation = HostGpuVa(gv[i].BufferLocation);
+        }
+        obj->pc_list->IASetVertexBuffers(static_cast<UINT>(startSlot), static_cast<UINT>(numViews),
+                                         gv ? views.data() : nullptr);
     }
 #endif
     return 0;
@@ -1944,11 +2126,20 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListOMSetRenderTargets(
                   << ", single=" << singleHandle << ", dsv=0x" << dsv0 << std::dec << ")\n";
     }
     if (obj->pc_list) {
+        // A single handle stands for a contiguous range, so translating its
+        // start is enough; otherwise each entry is translated.
+        const auto* rtvs = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pRTVs);
+        D3D12_CPU_DESCRIPTOR_HANDLE host_rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+        const UINT n_rtv = static_cast<UINT>(std::min<uintptr_t>(numRTVs, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT));
+        const UINT n_copy = (singleHandle != 0) ? (n_rtv ? 1u : 0u) : n_rtv;
+        for (UINT i = 0; rtvs && i < n_copy; ++i) host_rtvs[i].ptr = HostCpuHandle(rtvs[i].ptr);
+        D3D12_CPU_DESCRIPTOR_HANDLE host_dsv{};
+        if (pDSV) host_dsv.ptr = HostCpuHandle(reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pDSV)->ptr);
         obj->pc_list->OMSetRenderTargets(
-            static_cast<UINT>(numRTVs),
-            reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pRTVs),
+            n_rtv,
+            rtvs ? host_rtvs : nullptr,
             static_cast<BOOL>(singleHandle != 0),
-            reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pDSV));
+            pDSV ? &host_dsv : nullptr);
     }
 #endif
     return 0;
@@ -1959,7 +2150,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListClearDepthStencilView(
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     if (obj->pc_list) {
-        D3D12_CPU_DESCRIPTOR_HANDLE h{static_cast<SIZE_T>(dsv)};
+        D3D12_CPU_DESCRIPTOR_HANDLE h{HostCpuHandle(dsv)};
         // Note: on Win64 ABI float arg3 is passed in XMM3; use ClearDepthStencilView with
         // depth=1.0f fallback unless we capture XMM3 in a typed signature below.
         (void)depthBits;
@@ -1976,7 +2167,7 @@ void SCARLETTX_GDK_CALLBACK CmdListClearDepthStencilViewTyped(
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     if (obj->pc_list) {
-        D3D12_CPU_DESCRIPTOR_HANDLE h{static_cast<SIZE_T>(dsv)};
+        D3D12_CPU_DESCRIPTOR_HANDLE h{HostCpuHandle(dsv)};
         obj->pc_list->ClearDepthStencilView(
             h, static_cast<D3D12_CLEAR_FLAGS>(flags), depth, stencil,
             static_cast<UINT>(numRects), reinterpret_cast<const D3D12_RECT*>(pRects));
@@ -1995,7 +2186,7 @@ void SCARLETTX_GDK_CALLBACK CmdListClearRenderTargetViewTyped(
                   << "), rects=" << numRects << ")\n";
     }
     if (obj->pc_list && colorRgba) {
-        D3D12_CPU_DESCRIPTOR_HANDLE h{static_cast<SIZE_T>(rtv)};
+        D3D12_CPU_DESCRIPTOR_HANDLE h{HostCpuHandle(rtv)};
         obj->pc_list->ClearRenderTargetView(
             h, colorRgba, static_cast<UINT>(numRects), reinterpret_cast<const D3D12_RECT*>(pRects));
     }
@@ -2030,12 +2221,15 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListTracedSlot(void*, uintptr_t a1, uintptr_t
     }
     return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
 }
+// Retail titles call Xbox-only methods past slot 128 (e.g. +0x418/+0x420);
+// a short table makes those calls jump through unrelated memory.
+constexpr size_t kCmdListSlots = 256;
 template <size_t... Is>
 constexpr std::array<ComVtableFn, sizeof...(Is) + 3> MakeCmdListVtable(std::index_sequence<Is...>) {
     return {&CmdListQueryInterface, &CmdListAddRef, &CmdListRelease, &CmdListTracedSlot<static_cast<int>(Is + 3)>...};
 }
-std::array<ComVtableFn, 96> BuildCmdListVtable() {
-    auto vtbl = MakeCmdListVtable(std::make_index_sequence<93>{});
+std::array<ComVtableFn, kCmdListSlots> BuildCmdListVtable() {
+    auto vtbl = MakeCmdListVtable(std::make_index_sequence<kCmdListSlots - 3>{});
     vtbl[6] = &CmdListSetName;
     vtbl[8] = &CmdListGetType;
     vtbl[9] = &CmdListClose;
@@ -2089,9 +2283,9 @@ const auto kXboxCmdListProxyVtbl = BuildCmdListVtable();
 // slots 59 and 60, so each method after them sits two slots further on:
 // CopyTextureRegionX is slot 85. Checked against the method names in the
 // debug driver each SDK's titles ship with.
-std::array<ComVtableFn, 96> BuildCmdListVtableV4() {
+std::array<ComVtableFn, kCmdListSlots> BuildCmdListVtableV4() {
     const auto older = BuildCmdListVtable();
-    const auto unnamed = MakeCmdListVtable(std::make_index_sequence<93>{});
+    const auto unnamed = MakeCmdListVtable(std::make_index_sequence<kCmdListSlots - 3>{});
     auto vtbl = older;
     for (size_t slot = 59; slot < vtbl.size(); ++slot) {
         const bool named = slot >= 61 && older[slot - 2] != unnamed[slot - 2];
@@ -2100,8 +2294,8 @@ std::array<ComVtableFn, 96> BuildCmdListVtableV4() {
     return vtbl;
 }
 const auto kXboxCmdListProxyVtblV4 = BuildCmdListVtableV4();
-std::array<ComVtableFn, 96> BuildDmaCmdListVtable() {
-    auto vtbl = MakeCmdListVtable(std::make_index_sequence<93>{});
+std::array<ComVtableFn, kCmdListSlots> BuildDmaCmdListVtable() {
+    auto vtbl = MakeCmdListVtable(std::make_index_sequence<kCmdListSlots - 3>{});
     vtbl[6] = &CmdListSetName;
     vtbl[8] = &CmdListGetType;
     vtbl[9] = &CmdListClose;
@@ -2243,6 +2437,18 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyExecuteCommandLists(
             g_flushed_epoch.store(epoch, std::memory_order_relaxed);
         }
         obj->pc_queue->ExecuteCommandLists(static_cast<UINT>(pc_lists.size()), pc_lists.data());
+        if (obj->pc_device) {
+            static std::atomic<bool> reported{false};
+            const HRESULT removed = obj->pc_device->GetDeviceRemovedReason();
+            if (FAILED(removed) && !reported.exchange(true)) {
+                std::cerr << "[ScarlettX][d3d12_xs] device removed (0x" << std::hex << static_cast<uint32_t>(removed)
+                          << std::dec << ") after submit #" << g_submit_count.load() << "\n";
+                ReportDred(obj->pc_device);
+                DumpD3D12InfoQueue(obj->pc_device, "ExecuteCommandLists");
+            } else if (std::getenv("SCARLETTX_D3D12_DEBUG")) {
+                DumpD3D12InfoQueue(obj->pc_device, "ExecuteCommandLists");
+            }
+        }
     }
 #endif
     return 0;
@@ -3079,7 +3285,20 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateDescriptorHeap(
         pc_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     }
     ID3D12DescriptorHeap* pc_heap = nullptr;
-    const HRESULT hr = obj->pc_device->CreateDescriptorHeap(&pc_desc, IID_PPV_ARGS(&pc_heap));
+    HRESULT hr = obj->pc_device->CreateDescriptorHeap(&pc_desc, IID_PPV_ARGS(&pc_heap));
+    CheckDeviceRemoved(obj->pc_device, "CreateDescriptorHeap");
+    if (FAILED(hr) && (pc_desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) {
+        // The console allows larger shader-visible heaps than PC drivers
+        // (resource binding tier 3 guarantees 1,000,000 view descriptors;
+        // samplers are capped at 2048). Retry at the host maximum.
+        const UINT cap = pc_desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 2048u : 1000000u;
+        if (pc_desc.NumDescriptors > cap) {
+            std::cerr << "[ScarlettX][d3d12_xs] CreateDescriptorHeap: " << pc_desc.NumDescriptors
+                      << " shader-visible descriptors exceed the host limit, clamped to " << cap << "\n";
+            pc_desc.NumDescriptors = cap;
+            hr = obj->pc_device->CreateDescriptorHeap(&pc_desc, IID_PPV_ARGS(&pc_heap));
+        }
+    }
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateDescriptorHeap(type="
                   << static_cast<uint32_t>(guest_desc->Type)
@@ -3087,11 +3306,36 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateDescriptorHeap(
                   << ", flags=0x" << std::hex << static_cast<uint32_t>(guest_desc->Flags)
                   << ") -> 0x" << static_cast<uint32_t>(hr) << std::dec << "\n";
     }
-    if (FAILED(hr) || !pc_heap) return static_cast<intptr_t>(hr);
+    if (FAILED(hr) || !pc_heap) {
+        DumpD3D12InfoQueue(obj->pc_device, "CreateDescriptorHeap");
+        return static_cast<intptr_t>(hr);
+    }
     auto* proxy = new XboxD3D12DescriptorHeapProxy();
     proxy->lpVtbl = kXboxD3D12DescriptorHeapProxyVtbl.data();
     proxy->pc_heap = pc_heap;
     proxy->orig_desc = *guest_desc;
+    {
+        // Xbox extension of the desc: +0x10 placement address, +0x18 size in
+        // bytes. Only trusted when it is consistent with the descriptor count.
+        const auto* ext = reinterpret_cast<const uint64_t*>(pDesc + sizeof(D3D12_DESCRIPTOR_HEAP_DESC));
+        const uint64_t base = ext[0], size = ext[1];
+        const UINT inc = obj->pc_device->GetDescriptorHandleIncrementSize(pc_desc.Type);
+        if (base && (base & 7) == 0 && size >= static_cast<uint64_t>(guest_desc->NumDescriptors) * 8 &&
+            size <= static_cast<uint64_t>(guest_desc->NumDescriptors) * 256) {
+            proxy->guest_base = static_cast<uintptr_t>(base);
+            // Handles past the clamped host heap would land outside it.
+            proxy->guest_size = static_cast<uintptr_t>(std::min<uint64_t>(size, uint64_t{pc_desc.NumDescriptors} * inc));
+            const UINT64 gpu = (pc_desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+                                   ? pc_heap->GetGPUDescriptorHandleForHeapStart().ptr
+                                   : 0;
+            RegisterPlacedDescriptorHeap(proxy->guest_base, proxy->guest_size,
+                                         pc_heap->GetCPUDescriptorHandleForHeapStart().ptr, gpu);
+            if (TraceEnabled()) {
+                std::cerr << "[ScarlettX][d3d12_xs] descriptor heap placed at 0x" << std::hex << base
+                          << " (+0x" << size << ", host inc " << std::dec << inc << ")\n";
+            }
+        }
+    }
     *out = proxy;
     return 0;  // S_OK
 #else
@@ -3132,11 +3376,9 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyTracedSlot(void* /*self*/, uintptr_t a1, ui
     if (TraceEnabled()) {
         uintptr_t norm_ret = 0;
 #if defined(_WIN32)
-        const auto ret = reinterpret_cast<uintptr_t>(SCARLETTX_RETURN_ADDRESS());
-        const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
-        if (ret >= base && ret < base + 0x20000000u) {
-            norm_ret = 0x140000000ull + (ret - base);
-        }
+        // Titles are mapped at their preferred base, so the raw address is
+        // directly comparable with a disassembly of the title.
+        norm_ret = reinterpret_cast<uintptr_t>(SCARLETTX_RETURN_ADDRESS());
 #endif
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::vtable[" << Slot
                   << "](a1=0x" << std::hex << a1 << ", a2=0x" << a2 << ", a3=0x" << a3
@@ -3172,6 +3414,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandAllocator(
     }
     ID3D12CommandAllocator* pc_alloc = nullptr;
     const HRESULT hr = obj->pc_device->CreateCommandAllocator(type, IID_PPV_ARGS(&pc_alloc));
+    CheckDeviceRemoved(obj->pc_device, "CreateCommandAllocator");
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateCommandAllocator(type="
                   << static_cast<uint32_t>(type_raw) << ") -> 0x"
@@ -3181,6 +3424,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandAllocator(
                       << static_cast<uint32_t>(obj->pc_device->GetDeviceRemovedReason());
         }
         std::cerr << std::dec << "\n";
+        if (FAILED(hr)) DumpD3D12InfoQueue(obj->pc_device, "CreateCommandAllocator");
     }
     if (FAILED(hr) || !pc_alloc) return static_cast<intptr_t>(hr);
     auto* proxy = new XboxD3D12CommandAllocatorProxy();
@@ -3207,6 +3451,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
     }
     ID3D12PipelineState* pc_pso = nullptr;
     const HRESULT hr = obj->pc_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pc_pso));
+    CheckDeviceRemoved(obj->pc_device, "CreateGraphicsPipelineState");
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateGraphicsPipelineState("
                   << "vs=" << desc.VS.BytecodeLength << ", ps=" << desc.PS.BytecodeLength
@@ -3217,6 +3462,203 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
                   << ", blend0=" << desc.BlendState.RenderTarget[0].BlendEnable
                   << ") -> 0x"
                   << std::hex << static_cast<uint32_t>(hr) << std::dec << "\n";
+    }
+    if (FAILED(hr) || !pc_pso) return static_cast<intptr_t>(hr);
+    auto* proxy = new XboxD3D12SimpleObjectProxy();
+    proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
+    proxy->pc_obj = pc_pso;
+    proxy->kind = "PipelineState";
+    *out = proxy;
+    return 0;
+#else
+    return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
+#endif
+}
+
+// Xbox device slot 61 (+0x1e8): writes a sampler descriptor from an 0x54-byte
+// console sampler description: (const desc*, D3D12_CPU_DESCRIPTOR_HANDLE, ?).
+// The layout is inferred from the code a retail title builds it with, so each
+// field is used only when its value is valid for PC; the rest is defaulted.
+intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateSamplerX(void* self, uintptr_t pDesc, uintptr_t dest, uintptr_t) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
+    if (!obj || !obj->pc_device || !dest) return 0;
+    D3D12_SAMPLER_DESC sd{};
+    sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sd.MaxAnisotropy = 1;
+    sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sd.MaxLOD = D3D12_FLOAT32_MAX;
+    if (pDesc) {
+        const auto* u = reinterpret_cast<const uint32_t*>(pDesc);
+        const auto* f = reinterpret_cast<const float*>(pDesc);
+        if (u[0] <= 0x1d5) sd.Filter = static_cast<D3D12_FILTER>(u[0]);
+        auto addr = [](uint32_t v, D3D12_TEXTURE_ADDRESS_MODE& m) {
+            if (v >= 1 && v <= 5) m = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(v);
+        };
+        addr(u[1], sd.AddressU);
+        addr(u[2], sd.AddressV);
+        addr(u[3], sd.AddressW);
+        if (u[5] >= 1 && u[5] <= 8) sd.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(u[5]);
+        const uint32_t aniso = u[0x34 / 4];
+        if (aniso >= 1 && aniso <= 16) sd.MaxAnisotropy = aniso;
+        const float min_lod = f[0x24 / 4], max_lod = f[0x28 / 4], bias = f[0x30 / 4];
+        if (min_lod >= 0.0f && min_lod <= 16.0f) sd.MinLOD = min_lod;
+        if (max_lod >= sd.MinLOD && max_lod <= D3D12_FLOAT32_MAX) sd.MaxLOD = max_lod;
+        if (bias >= -16.0f && bias <= 15.99f) sd.MipLODBias = bias;
+        for (int i = 0; i < 4; ++i) {
+            const float c = f[0x44 / 4 + i];
+            sd.BorderColor[i] = (c >= 0.0f && c <= 1.0f) ? c : 0.0f;
+        }
+        // Anisotropic filters need MaxAnisotropy >= 1, comparison filters a func.
+        const bool comparison = (sd.Filter & 0x80) != 0;
+        if (comparison && sd.ComparisonFunc == D3D12_COMPARISON_FUNC_NEVER) {
+            sd.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        }
+    }
+    obj->pc_device->CreateSampler(&sd, D3D12_CPU_DESCRIPTOR_HANDLE{HostCpuHandle(dest)});
+    CheckDeviceRemoved(obj->pc_device, "CreateSamplerX");
+    static std::atomic<int> logged{0};
+    if (TraceEnabled() && logged.fetch_add(1) < 4) {
+        std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateSamplerX(filter=0x" << std::hex << sd.Filter
+                  << std::dec << ", addr=" << sd.AddressU << "/" << sd.AddressV << "/" << sd.AddressW
+                  << ", aniso=" << sd.MaxAnisotropy << ")\n";
+    }
+#endif
+    return 0;
+}
+
+// Size of one subobject in a pipeline state stream, as laid out by d3dx12's
+// alignas(void*) CD3DX12_PIPELINE_STATE_STREAM_* wrappers: a 4-byte type,
+// the inner struct at its natural alignment, the whole rounded up to 8.
+// 0 for types this layer does not know.
+size_t PsoSubobjectSize(uint32_t type) {
+    auto wrap = [](size_t inner_align, size_t inner_size) {
+        const size_t off = inner_align >= 8 ? 8 : 4;
+        return (off + inner_size + 7) & ~size_t{7};
+    };
+    switch (type) {
+        case 0: return wrap(8, sizeof(void*));                             // ROOT_SIGNATURE
+        case 1: case 2: case 3: case 4: case 5: case 6:                     // VS PS DS HS GS CS
+        case 24: case 25:                                                   // AS MS
+            return wrap(8, sizeof(D3D12_SHADER_BYTECODE));
+        case 7: return wrap(8, sizeof(D3D12_STREAM_OUTPUT_DESC));
+        case 8: return wrap(4, sizeof(D3D12_BLEND_DESC));
+        case 9: return wrap(4, sizeof(UINT));                              // SAMPLE_MASK
+        case 10: return wrap(4, sizeof(D3D12_RASTERIZER_DESC));
+        case 11: return wrap(4, sizeof(D3D12_DEPTH_STENCIL_DESC));
+        case 12: return wrap(8, sizeof(D3D12_INPUT_LAYOUT_DESC));
+        case 13: return wrap(4, sizeof(UINT));                             // IB_STRIP_CUT_VALUE
+        case 14: return wrap(4, sizeof(UINT));                             // PRIMITIVE_TOPOLOGY
+        case 15: return wrap(4, sizeof(D3D12_RT_FORMAT_ARRAY));
+        case 16: return wrap(4, sizeof(DXGI_FORMAT));                      // DEPTH_STENCIL_FORMAT
+        case 17: return wrap(4, sizeof(DXGI_SAMPLE_DESC));
+        case 18: return wrap(4, sizeof(UINT));                             // NODE_MASK
+        case 19: return wrap(8, sizeof(D3D12_CACHED_PIPELINE_STATE));
+        case 20: return wrap(4, sizeof(UINT));                             // FLAGS
+        case 21: return wrap(4, sizeof(D3D12_DEPTH_STENCIL_DESC1));
+        case 22: return wrap(8, sizeof(D3D12_VIEW_INSTANCING_DESC));
+        default: return 0;
+    }
+}
+
+// Xbox device slot 86 (+0x2b0): ID3D12Device2::CreatePipelineState, checked
+// by the riid a retail title passes (IID_ID3D12PipelineState). The stream is
+// copied with root signature proxies replaced by host objects; subobjects of
+// unknown type end the stream (they are logged).
+intptr_t SCARLETTX_GDK_CALLBACK ProxyCreatePipelineStateStream(void* self, uintptr_t pDesc, uintptr_t /*riid*/,
+                                                               uintptr_t ppPso) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
+    auto** out = reinterpret_cast<void**>(ppPso);
+    if (!obj || !obj->pc_device || !pDesc || !out) return static_cast<intptr_t>(E_INVALIDARG);
+    *out = nullptr;
+    const auto* sd = reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(pDesc);
+    const auto* src = static_cast<const uint8_t*>(sd->pPipelineStateSubobjectStream);
+    std::vector<uint8_t> copy;
+    copy.reserve(sd->SizeInBytes);
+    size_t pos = 0;
+    size_t shader_bytes = 0;
+    bool has_ms = false, has_cs = false;
+    while (src && pos + 4 <= sd->SizeInBytes) {
+        uint32_t type = 0;
+        std::memcpy(&type, src + pos, 4);
+        const size_t size = PsoSubobjectSize(type);
+        if (!size || pos + size > sd->SizeInBytes) {
+            static std::atomic<int> warned{0};
+            if (warned.fetch_add(1) < 8) {
+                std::cerr << "[ScarlettX][d3d12_xs] CreatePipelineState: subobject type " << type << " at +" << pos
+                          << " of " << sd->SizeInBytes << " not understood; rest of the stream dropped\n";
+            }
+            break;
+        }
+        const size_t at = copy.size();
+        copy.insert(copy.end(), src + pos, src + pos + size);
+        if (type == 0) {
+            void* rs = nullptr;
+            std::memcpy(&rs, &copy[at + 8], sizeof rs);
+            if (rs) {
+                rs = reinterpret_cast<XboxD3D12SimpleObjectProxy*>(rs)->pc_obj;
+                std::memcpy(&copy[at + 8], &rs, sizeof rs);
+            }
+        } else if (type <= 6 || type == 24 || type == 25) {
+            D3D12_SHADER_BYTECODE bc{};
+            std::memcpy(&bc, &copy[at + 8], sizeof bc);
+            shader_bytes += bc.BytecodeLength;
+            static std::atomic<int> dumped{0};
+            if (bc.pShaderBytecode && bc.BytecodeLength >= 32 && dumped.fetch_add(1) < 4) {
+                // DXBC container: "DXBC", hash[16], version, size, part count, offsets; parts are FourCC-tagged.
+                const auto* b = static_cast<const uint8_t*>(bc.pShaderBytecode);
+                std::cerr << "[ScarlettX][d3d12_xs] shader type " << type << " len=" << bc.BytecodeLength
+                          << " magic='" << std::string(reinterpret_cast<const char*>(b), 4) << "' hash=";
+                for (int i = 4; i < 20; ++i) {
+                    static const char* hx = "0123456789abcdef";
+                    std::cerr << hx[b[i] >> 4] << hx[b[i] & 15];
+                }
+                uint32_t ver = 0, total = 0;
+                std::memcpy(&ver, b + 20, 4);
+                std::memcpy(&total, b + 24, 4);
+                std::cerr << " ver=0x" << std::hex << ver << std::dec << " size=" << total;
+                uint32_t parts = 0;
+                std::memcpy(&parts, b + 28, 4);
+                for (uint32_t i = 0; i < parts && i < 16 && 32 + 4 * i + 4 <= bc.BytecodeLength; ++i) {
+                    uint32_t off = 0;
+                    std::memcpy(&off, b + 32 + 4 * i, 4);
+                    if (off + 8 <= bc.BytecodeLength) {
+                        uint32_t psize = 0;
+                        std::memcpy(&psize, b + off + 4, 4);
+                        std::cerr << " " << std::string(reinterpret_cast<const char*>(b + off), 4) << ":" << psize;
+                    }
+                }
+                std::cerr << "\n";
+                if (const char* dir = std::getenv("SCARLETTX_DUMP_SHADERS"); dir && *dir) {
+                    const std::string path = std::string(dir) + "\\shader_" + std::to_string(dumped.load()) + "_t" +
+                                             std::to_string(type) + ".dxbc";
+                    if (FILE* fp = std::fopen(path.c_str(), "wb")) {
+                        std::fwrite(b, 1, bc.BytecodeLength, fp);
+                        std::fclose(fp);
+                    }
+                }
+            }
+            has_ms |= (type == 25 && bc.BytecodeLength);
+            has_cs |= (type == 6 && bc.BytecodeLength);
+        }
+        pos += size;
+    }
+    ID3D12Device2* dev2 = nullptr;
+    HRESULT hr = obj->pc_device->QueryInterface(IID_PPV_ARGS(&dev2));
+    ID3D12PipelineState* pc_pso = nullptr;
+    if (SUCCEEDED(hr) && dev2) {
+        D3D12_PIPELINE_STATE_STREAM_DESC hd{copy.size(), copy.data()};
+        hr = dev2->CreatePipelineState(&hd, IID_PPV_ARGS(&pc_pso));
+        dev2->Release();
+    }
+    CheckDeviceRemoved(obj->pc_device, "CreatePipelineState");
+    if (TraceEnabled()) {
+        std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreatePipelineState(stream=" << sd->SizeInBytes
+                  << "->" << copy.size() << ", shaders=" << shader_bytes << (has_ms ? ", mesh" : "")
+                  << (has_cs ? ", compute" : "") << ") -> 0x" << std::hex << static_cast<uint32_t>(hr) << std::dec
+                  << "\n";
     }
     if (FAILED(hr) || !pc_pso) return static_cast<intptr_t>(hr);
     auto* proxy = new XboxD3D12SimpleObjectProxy();
@@ -3244,6 +3686,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateComputePipelineState(
     }
     ID3D12PipelineState* pc_pso = nullptr;
     const HRESULT hr = obj->pc_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pc_pso));
+    CheckDeviceRemoved(obj->pc_device, "CreateComputePipelineState");
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateComputePipelineState() -> 0x"
                   << std::hex << static_cast<uint32_t>(hr) << std::dec << "\n";
@@ -3284,6 +3727,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandList(
     ID3D12GraphicsCommandList* pc_list = nullptr;
     const HRESULT hr = obj->pc_device->CreateCommandList(
         static_cast<UINT>(nodeMask), type, alloc_proxy->pc_alloc, pc_pso, IID_PPV_ARGS(&pc_list));
+    CheckDeviceRemoved(obj->pc_device, "CreateCommandList");
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateCommandList(type="
                   << static_cast<uint32_t>(type_raw) << ") -> 0x"
@@ -3313,11 +3757,21 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateRootSignature(
     const HRESULT hr = obj->pc_device->CreateRootSignature(
         static_cast<UINT>(nodeMask), reinterpret_cast<const void*>(pBlob),
         static_cast<SIZE_T>(blobLen), IID_PPV_ARGS(&pc_rs));
+    CheckDeviceRemoved(obj->pc_device, "CreateRootSignature");
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateRootSignature(len="
                   << blobLen << ") -> 0x" << std::hex << static_cast<uint32_t>(hr) << std::dec << "\n";
     }
-    if (FAILED(hr) || !pc_rs) return static_cast<intptr_t>(hr);
+    if (FAILED(hr) || !pc_rs) {
+        const HRESULT removed = obj->pc_device->GetDeviceRemovedReason();
+        if (FAILED(removed)) {
+            std::cerr << "[ScarlettX][d3d12_xs] device removed, reason 0x" << std::hex
+                      << static_cast<uint32_t>(removed) << std::dec << "\n";
+            ReportDred(obj->pc_device);
+            DumpD3D12InfoQueue(obj->pc_device, "CreateRootSignature");
+        }
+        return static_cast<intptr_t>(hr);
+    }
     auto* proxy = new XboxD3D12SimpleObjectProxy();
     proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
     proxy->pc_obj = pc_rs;
@@ -3343,8 +3797,26 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateConstantBufferView(
                       << ", size=" << (d ? d->SizeInBytes : 0)
                       << ", dst=0x" << std::hex << destDesc << std::dec << ")\n";
         }
-        D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
-        obj->pc_device->CreateConstantBufferView(d, h);
+        D3D12_CPU_DESCRIPTOR_HANDLE h{HostCpuHandle(destDesc)};
+        if (d) {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC hd = *d;
+            hd.BufferLocation = HostGpuVa(d->BufferLocation);
+            // PC requires CBV sizes in multiples of 256 bytes (the console
+            // accepts smaller ones); an unaligned size removes the device.
+            hd.SizeInBytes = (hd.SizeInBytes + 255u) & ~255u;
+            if (hd.BufferLocation & 255u) {
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 8) {
+                    std::cerr << "[ScarlettX][d3d12_xs] CBV location 0x" << std::hex << hd.BufferLocation << std::dec
+                              << " is not 256-byte aligned\n";
+                }
+            }
+            obj->pc_device->CreateConstantBufferView(&hd, h);
+            CheckDeviceRemoved(obj->pc_device, "CreateCBV");
+        } else {
+            obj->pc_device->CreateConstantBufferView(nullptr, h);
+            CheckDeviceRemoved(obj->pc_device, "CreateCBV(null)");
+        }
     }
 #endif
     return 0;
@@ -3375,8 +3847,9 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateShaderResourceView(
                       << ", dim=" << (d ? static_cast<int>(d->ViewDimension) : -1)
                       << ", dst=0x" << std::hex << destDesc << std::dec << ")\n";
         }
-        D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
+        D3D12_CPU_DESCRIPTOR_HANDLE h{HostCpuHandle(destDesc)};
         obj->pc_device->CreateShaderResourceView(pc_res, d, h);
+        CheckDeviceRemoved(obj->pc_device, "CreateSRV");
     }
 #endif
     return 0;
@@ -3389,9 +3862,10 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateUnorderedAccessView(
     if (obj && obj->pc_device) {
         ID3D12Resource* pc_res = pResource ? reinterpret_cast<XboxD3D12ResourceProxy*>(pResource)->pc_res : nullptr;
         ID3D12Resource* pc_cnt = pCounter ? reinterpret_cast<XboxD3D12ResourceProxy*>(pCounter)->pc_res : nullptr;
-        D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
+        D3D12_CPU_DESCRIPTOR_HANDLE h{HostCpuHandle(destDesc)};
         obj->pc_device->CreateUnorderedAccessView(
             pc_res, pc_cnt, reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(pDesc), h);
+        CheckDeviceRemoved(obj->pc_device, "CreateUAV");
     }
 #endif
     return 0;
@@ -3420,8 +3894,9 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateRenderTargetView(
                       << ", dim=" << (d ? static_cast<int>(d->ViewDimension) : -1)
                       << ", dst=0x" << std::hex << destDesc << std::dec << ")\n";
         }
-        D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
+        D3D12_CPU_DESCRIPTOR_HANDLE h{HostCpuHandle(destDesc)};
         obj->pc_device->CreateRenderTargetView(pc_res, d, h);
+        CheckDeviceRemoved(obj->pc_device, "CreateRTV");
     }
 #endif
     return 0;
@@ -3433,9 +3908,10 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateDepthStencilView(
     auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
     if (obj && obj->pc_device) {
         ID3D12Resource* pc_res = pResource ? reinterpret_cast<XboxD3D12ResourceProxy*>(pResource)->pc_res : nullptr;
-        D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
+        D3D12_CPU_DESCRIPTOR_HANDLE h{HostCpuHandle(destDesc)};
         obj->pc_device->CreateDepthStencilView(
             pc_res, reinterpret_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(pDesc), h);
+        CheckDeviceRemoved(obj->pc_device, "CreateDSV");
     }
 #endif
     return 0;
@@ -3446,8 +3922,9 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateSampler(
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
     if (obj && obj->pc_device && pDesc) {
-        D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
+        D3D12_CPU_DESCRIPTOR_HANDLE h{HostCpuHandle(destDesc)};
         obj->pc_device->CreateSampler(reinterpret_cast<const D3D12_SAMPLER_DESC*>(pDesc), h);
+        CheckDeviceRemoved(obj->pc_device, "CreateSampler");
     }
 #endif
     return 0;
@@ -3468,14 +3945,21 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCopyDescriptors(
                       << ", dstRanges=" << numDstRanges << ", srcRanges=" << numSrcRanges
                       << ", type=" << static_cast<uint32_t>(pc_type) << ")\n";
         }
+        std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> dst(static_cast<size_t>(numDstRanges));
+        std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> src(static_cast<size_t>(numSrcRanges));
+        const auto* gd = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pDstStarts);
+        const auto* gs = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pSrcStarts);
+        for (size_t i = 0; gd && i < dst.size(); ++i) dst[i].ptr = HostCpuHandle(gd[i].ptr);
+        for (size_t i = 0; gs && i < src.size(); ++i) src[i].ptr = HostCpuHandle(gs[i].ptr);
         obj->pc_device->CopyDescriptors(
             static_cast<UINT>(numDstRanges),
-            reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pDstStarts),
+            gd ? dst.data() : nullptr,
             reinterpret_cast<const UINT*>(pDstSizes),
             static_cast<UINT>(numSrcRanges),
-            reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pSrcStarts),
+            gs ? src.data() : nullptr,
             reinterpret_cast<const UINT*>(pSrcSizes),
             pc_type);
+        CheckDeviceRemoved(obj->pc_device, "CopyDescriptors");
     }
 #endif
     return 0;
@@ -3488,8 +3972,8 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCopyDescriptorsSimple(
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
     if (obj && obj->pc_device) {
-        D3D12_CPU_DESCRIPTOR_HANDLE dst{destStart};
-        D3D12_CPU_DESCRIPTOR_HANDLE src{srcStart};
+        D3D12_CPU_DESCRIPTOR_HANDLE dst{HostCpuHandle(destStart)};
+        D3D12_CPU_DESCRIPTOR_HANDLE src{HostCpuHandle(srcStart)};
         auto pc_type = static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(type_raw);
         if (type_raw >= 4) pc_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         if (TraceEnabled() && n <= 12) {
@@ -3499,12 +3983,13 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCopyDescriptorsSimple(
                       << ", type=" << static_cast<uint32_t>(pc_type) << ")\n";
         }
         obj->pc_device->CopyDescriptorsSimple(static_cast<UINT>(numDescs), dst, src, pc_type);
+        CheckDeviceRemoved(obj->pc_device, "CopyDescriptorsSimple");
     }
 #endif
     return 0;
 }
 
-extern const std::array<ComVtableFn, 128> kXboxDeviceProxyVtbl;
+extern const std::array<ComVtableFn, 256> kXboxDeviceProxyVtbl;
 
 intptr_t SCARLETTX_GDK_CALLBACK ProxyGetResourceAllocationInfo(
     void* arg0, uintptr_t arg1, uintptr_t visibleMask, uintptr_t numDescs, uintptr_t pDescs) {
@@ -3586,6 +4071,32 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateHeap(void* self, uintptr_t pDesc, uin
     }
     *out = proxy;
     return 0;
+#else
+    return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
+#endif
+}
+
+// Xbox device slot 74 (+0x250): a heap over title memory the title backed
+// with XMemMapPhysicalPages. Call site in a retail title:
+//   (void* address, UINT numPages64K, ID3D12Heap** ppHeap) -> HRESULT
+// Like CreateHeap here, the proxy only records the description; resources
+// placed in it get host memory of their own, so the title's CPU writes to the
+// range are not seen through them.
+intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateHeapFromPhysicalPagesX(void* self, uintptr_t address, uintptr_t numPages,
+                                                                  uintptr_t ppvHeap) {
+#if defined(_WIN32)
+    D3D12_HEAP_DESC hd{};
+    hd.SizeInBytes = static_cast<UINT64>(static_cast<uint32_t>(numPages)) << 16;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    hd.Flags = D3D12_HEAP_FLAG_NONE;
+    const intptr_t hr = ProxyCreateHeap(self, reinterpret_cast<uintptr_t>(&hd), 0, ppvHeap);
+    if (TraceEnabled()) {
+        std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateHeapFromPhysicalPagesX(va=0x" << std::hex
+                  << address << ", size=0x" << hd.SizeInBytes << ") -> 0x" << static_cast<uint32_t>(hr) << std::dec
+                  << "\n";
+    }
+    return hr;
 #else
     return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
 #endif
@@ -3683,6 +4194,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommittedResource(
     const HRESULT hr = obj->pc_device->CreateCommittedResource(
         &hp, pc_heap_flags, &desc, pc_state,
         pc_clear_val, IID_PPV_ARGS(&pc_res));
+    CheckDeviceRemoved(obj->pc_device, "CreateCommittedResource");
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateCommittedResource(dim="
                   << static_cast<uint32_t>(desc.Dimension) << ", w=" << desc.Width
@@ -3745,6 +4257,315 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreatePlacedResource(
 #endif
 }
 
+// --- GPU access to title physical pages -------------------------------------
+// xgameruntime.dll backs XMemMapPhysicalPages with views of pagefile sections.
+// A buffer the title places over such memory is built from those same
+// sections, so GPU and CPU see one copy: a placed resource when the range is
+// one contiguous run of a section, otherwise a reserved resource whose 64 KB
+// tiles are mapped run by run (the GPU-side twin of the physical page map).
+struct ScxXMemBackingRun {
+    HANDLE section;
+    uint64_t offset;
+    uint64_t va;
+    uint64_t length;
+};
+using ScxXMemQueryBackingFn = size_t (*)(uint64_t, uint64_t, ScxXMemBackingRun*, size_t);
+
+ScxXMemQueryBackingFn XMemQueryBacking() {
+    static const ScxXMemQueryBackingFn fn = [] {
+        HMODULE m = GetModuleHandleA("xgameruntime.dll");
+        return m ? reinterpret_cast<ScxXMemQueryBackingFn>(GetProcAddress(m, "ScxXMemQueryBacking")) : nullptr;
+    }();
+    return fn;
+}
+
+std::mutex g_section_heaps_mutex;
+std::map<HANDLE, ID3D12Heap*> g_section_heaps;
+
+ID3D12Heap* SectionHeap(ID3D12Device* dev, HANDLE section) {
+    std::lock_guard<std::mutex> lock(g_section_heaps_mutex);
+    auto it = g_section_heaps.find(section);
+    if (it != g_section_heaps.end()) return it->second;
+    ID3D12Device3* dev3 = nullptr;
+    ID3D12Heap* heap = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev3))) && dev3) {
+        const HRESULT hr = dev3->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&heap));
+        if (FAILED(hr)) {
+            std::cerr << "[ScarlettX][d3d12_xs] OpenExistingHeapFromFileMapping failed 0x" << std::hex
+                      << static_cast<uint32_t>(hr) << std::dec << "\n";
+            heap = nullptr;
+        }
+        dev3->Release();
+    }
+    g_section_heaps[section] = heap;  // failures are cached too
+    return heap;
+}
+
+HRESULT CreateBufferOverGuestPages(ID3D12Device* dev, uintptr_t address, const D3D12_RESOURCE_DESC& desc,
+                                   ID3D12Resource** out, const char** path) {
+    auto query = XMemQueryBacking();
+    if (!query || (address & 0xFFFF) != 0) return E_NOTIMPL;
+    const uint64_t size = (desc.Width + 0xFFFF) & ~uint64_t{0xFFFF};
+    std::vector<ScxXMemBackingRun> runs(static_cast<size_t>(size >> 16));
+    const size_t n = query(address, size, runs.data(), runs.size());
+    if (!n) return E_NOTIMPL;  // not (fully) physical-page memory
+    D3D12_RESOURCE_DESC bd = desc;
+    bd.Alignment = 0;
+    bd.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        (static_cast<uint32_t>(desc.Flags) & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+        D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    if (n == 1) {
+        ID3D12Heap* heap = SectionHeap(dev, runs[0].section);
+        if (!heap) return E_FAIL;
+        const HRESULT hr = dev->CreatePlacedResource(heap, runs[0].offset, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                     IID_PPV_ARGS(out));
+        CheckDeviceRemoved(dev, "SectionPlacedBuffer");
+        if (SUCCEEDED(hr)) *path = "section-placed";
+        return hr;
+    }
+    // UpdateTileMappings rejects cross-adapter heaps, so a range made of
+    // several runs cannot be one GPU resource.
+    std::cerr << "[ScarlettX][d3d12_xs] buffer at 0x" << std::hex << address << " (+0x" << bd.Width << ") spans "
+              << std::dec << n << " section runs; not shareable with the GPU\n";
+    return E_NOTIMPL;
+}
+
+// --- lazily created GPU views of title memory --------------------------------
+std::atomic<ID3D12Device*> g_host_device{nullptr};
+std::mutex g_resolve_mutex;
+std::vector<ID3D12Resource*> g_guest_view_buffers;      // kept alive for the process
+std::map<uint64_t, uint64_t> g_unresolvable;           // 64 KB-aligned pages already tried
+
+using ScxXMemRegionOfFn = int (*)(uint64_t, uint64_t*, uint64_t*);
+
+bool PlaceOneBufferOnHeap(ID3D12Device* dev, ID3D12Heap* heap, uint64_t heap_offset, uint64_t width,
+                          uint64_t guest_base);
+
+// D3D12 resources are limited to 2 GB (views on larger ones remove the
+// device). Larger ranges are covered by 1 GB buffers every 512 MB, so any
+// view of up to 512 MB lies inside one of them; lookups pick the last chunk
+// starting at or below an address.
+bool PlaceBufferOnHeap(ID3D12Device* dev, ID3D12Heap* heap, uint64_t heap_offset, uint64_t width, uint64_t guest_base) {
+    constexpr uint64_t kChunk = 1ull << 30, kStep = 1ull << 29;
+    if (width <= kChunk) return PlaceOneBufferOnHeap(dev, heap, heap_offset, width, guest_base);
+    bool ok = true;
+    for (uint64_t off = 0; off < width; off += kStep) {
+        const uint64_t len = std::min(kChunk, width - off);
+        ok = PlaceOneBufferOnHeap(dev, heap, heap_offset + off, len, guest_base + off) && ok;
+        if (off + len == width) break;
+    }
+    return ok;
+}
+
+bool PlaceOneBufferOnHeap(ID3D12Device* dev, ID3D12Heap* heap, uint64_t heap_offset, uint64_t width,
+                          uint64_t guest_base) {
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = width;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    ID3D12Resource* res = nullptr;
+    const HRESULT hr = dev->CreatePlacedResource(heap, heap_offset, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                 IID_PPV_ARGS(&res));
+    CheckDeviceRemoved(dev, "PlaceBufferOnHeap");
+    if (FAILED(hr) || !res) {
+        std::cerr << "[ScarlettX][d3d12_xs] GPU view of title memory 0x" << std::hex << guest_base << " (+0x" << width
+                  << ") failed 0x" << static_cast<uint32_t>(hr) << std::dec << "\n";
+        return false;
+    }
+    g_guest_view_buffers.push_back(res);
+    RegisterGuestGpuRange(guest_base, width, res->GetGPUVirtualAddress());
+    if (TraceEnabled()) {
+        std::cerr << "[ScarlettX][d3d12_xs] GPU view of title memory 0x" << std::hex << guest_base << " (+0x" << width
+                  << ") -> 0x" << res->GetGPUVirtualAddress() << std::dec << "\n";
+    }
+    return true;
+}
+
+bool ResolveGuestGpuVa(uint64_t va) {
+    ID3D12Device* dev = g_host_device.load(std::memory_order_acquire);
+    if (!dev) return false;
+    std::lock_guard<std::mutex> lock(g_resolve_mutex);
+    const uint64_t page = va & ~uint64_t{0xFFFF};
+    if (g_unresolvable.count(page)) return false;
+    D3D12_GPU_VIRTUAL_ADDRESS dummy = 0;
+    if (LookupGuestGpuVa(va, &dummy)) return true;  // resolved by another thread meanwhile
+    bool ok = false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<const void*>(va), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT) {
+        if (mbi.Type == MEM_PRIVATE) {
+            // Ordinary title allocation: wrap the whole host allocation.
+            ID3D12Device3* dev3 = nullptr;
+            ID3D12Heap* heap = nullptr;
+            if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev3))) && dev3) {
+                if (SUCCEEDED(dev3->OpenExistingHeapFromAddress(mbi.AllocationBase, IID_PPV_ARGS(&heap))) && heap) {
+                    const uint64_t base = reinterpret_cast<uint64_t>(mbi.AllocationBase);
+                    ok = PlaceBufferOnHeap(dev, heap, 0, heap->GetDesc().SizeInBytes, base);
+                    heap->Release();
+                }
+                dev3->Release();
+            }
+        } else if (mbi.Type == MEM_MAPPED) {
+            // Physical-page views: one buffer per contiguous section run of
+            // the XMem reservation holding va.
+            static const auto region_of = [] {
+                HMODULE m = GetModuleHandleA("xgameruntime.dll");
+                return m ? reinterpret_cast<ScxXMemRegionOfFn>(GetProcAddress(m, "ScxXMemRegionOf")) : nullptr;
+            }();
+            static const auto sparse = [] {
+                HMODULE m = GetModuleHandleA("xgameruntime.dll");
+                return m ? reinterpret_cast<ScxXMemQueryBackingFn>(GetProcAddress(m, "ScxXMemQueryBackingSparse"))
+                         : nullptr;
+            }();
+            uint64_t rbase = 0, rsize = 0;
+            if (region_of && sparse && region_of(va, &rbase, &rsize)) {
+                std::vector<ScxXMemBackingRun> runs(static_cast<size_t>(std::min<uint64_t>(rsize >> 16, 65536)));
+                const size_t n = sparse(rbase, rsize, runs.data(), runs.size());
+                for (size_t i = 0; i < n; ++i) {
+                    if (LookupGuestGpuVa(runs[i].va, &dummy)) continue;
+                    if (ID3D12Heap* heap = SectionHeap(dev, runs[i].section)) {
+                        if (PlaceBufferOnHeap(dev, heap, runs[i].offset, runs[i].length, runs[i].va) &&
+                            va >= runs[i].va && va < runs[i].va + runs[i].length) {
+                            ok = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!ok) g_unresolvable[page] = 1;
+    return ok;
+}
+
+// Enhanced-barrier layout -> legacy resource state, for titles that create
+// resources with an initial layout while the rest of this layer tracks states.
+uint32_t LegacyStateForLayout(uint32_t layout) {
+    switch (layout) {
+        case 1: case 19: case 25: return D3D12_RESOURCE_STATE_GENERIC_READ;            // GENERIC_READ
+        case 2: return D3D12_RESOURCE_STATE_RENDER_TARGET;
+        case 3: case 20: case 26: return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        case 4: return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        case 5: return D3D12_RESOURCE_STATE_DEPTH_READ;
+        case 6: case 21: case 27:
+            return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        case 7: case 22: case 28: return D3D12_RESOURCE_STATE_COPY_SOURCE;
+        case 8: case 23: case 29: return D3D12_RESOURCE_STATE_COPY_DEST;
+        case 9: return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+        case 10: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        case 11: return D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        default: return D3D12_RESOURCE_STATE_COMMON;  // COMMON/PRESENT/UNDEFINED/queue-common
+    }
+}
+
+// Xbox device slot 127 (+0x3f8): ID3D12Device10::CreateCommittedResource3.
+// Order from a retail title's call site (heap flags 0x8 = ALLOW_DISPLAY):
+//   (pHeapProps, heapFlags, const D3D12_RESOURCE_DESC1*, initialLayout,
+//    pClearValue, pProtectedSession, numCastableFormats, pCastableFormats, riid, ppv)
+// D3D12_RESOURCE_DESC1 starts with the D3D12_RESOURCE_DESC fields.
+intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommittedResource3(
+    void* self, uintptr_t pHeapProps, uintptr_t heapFlags, uintptr_t pDesc1, uintptr_t initialLayout,
+    uintptr_t pClearVal, uintptr_t /*pProtected*/, uintptr_t /*numCastable*/, uintptr_t /*pCastable*/,
+    uintptr_t riid, uintptr_t ppvRes) {
+    const uint32_t state = LegacyStateForLayout(static_cast<uint32_t>(initialLayout));
+    const intptr_t hr = ProxyCreateCommittedResource(self, pHeapProps, heapFlags, pDesc1, state, pClearVal, riid,
+                                                     ppvRes);
+    if (TraceEnabled()) {
+        std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateCommittedResource3(layout="
+                  << static_cast<uint32_t>(initialLayout) << " -> state=0x" << std::hex << state << ") -> 0x"
+                  << static_cast<uint32_t>(hr) << std::dec << "\n";
+    }
+    return hr;
+}
+
+// Xbox device slot 133 (+0x428): a resource placed at a virtual address the
+// title reserved and backed itself (XMemVirtualAlloc + XMemMapPhysicalPages).
+// Argument order from a retail title's call site:
+//   (address, const D3D12_RESOURCE_DESC*, initialState, const D3D12_CLEAR_VALUE*, riid, ppv)
+// Buffers wrap the title's memory with OpenExistingHeapFromAddress so CPU
+// writes are what the GPU reads. Anything else gets memory of its own.
+intptr_t SCARLETTX_GDK_CALLBACK ProxyCreatePlacedResourceX(
+    void* self, uintptr_t address, uintptr_t pDesc, uintptr_t initialState,
+    uintptr_t pClearVal, uintptr_t riid, uintptr_t ppvRes) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
+    auto** out = reinterpret_cast<void**>(ppvRes);
+    if (!obj || !obj->pc_device || !pDesc || !out) return static_cast<intptr_t>(E_INVALIDARG);
+    *out = nullptr;
+    D3D12_RESOURCE_DESC desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(pDesc);
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<uint32_t>(desc.Flags) & 0x3Fu &
+                                                   ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+    HRESULT hr = E_FAIL;
+    ID3D12Resource* pc_res = nullptr;
+    const char* path = "committed";
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && address) {
+        hr = CreateBufferOverGuestPages(obj->pc_device, address, desc, &pc_res, &path);
+    }
+    if (!pc_res && desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && address) {
+        ID3D12Device3* dev3 = nullptr;
+        if (SUCCEEDED(obj->pc_device->QueryInterface(IID_PPV_ARGS(&dev3))) && dev3) {
+            ID3D12Heap* heap = nullptr;
+            hr = dev3->OpenExistingHeapFromAddress(reinterpret_cast<const void*>(address), IID_PPV_ARGS(&heap));
+            if (SUCCEEDED(hr) && heap) {
+                D3D12_RESOURCE_DESC bdesc = desc;
+                bdesc.Alignment = 0;
+                bdesc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+                    (static_cast<uint32_t>(bdesc.Flags) & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+                    D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+                const D3D12_HEAP_DESC hd = heap->GetDesc();
+                // The heap covers only the host allocation holding `address`;
+                // a buffer longer than that would let views run past its end.
+                hr = bdesc.Width <= hd.SizeInBytes
+                         ? obj->pc_device->CreatePlacedResource(heap, 0, &bdesc, D3D12_RESOURCE_STATE_COMMON,
+                                                                nullptr, IID_PPV_ARGS(&pc_res))
+                         : E_INVALIDARG;
+                heap->Release();  // the placed resource keeps it alive
+                if (SUCCEEDED(hr)) path = "existing-heap";
+            }
+            dev3->Release();
+        }
+    }
+    if (!pc_res) {
+        // Fallback: host memory of its own (the title's writes are not seen).
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT;
+        const uintptr_t state = hp.Type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ
+                                                                   : static_cast<uint32_t>(initialState);
+        const intptr_t r = ProxyCreateCommittedResource(self, reinterpret_cast<uintptr_t>(&hp), 0,
+                                                        reinterpret_cast<uintptr_t>(&desc), state, pClearVal, riid,
+                                                        ppvRes);
+        if (TraceEnabled()) {
+            std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreatePlacedResourceX(va=0x" << std::hex << address
+                      << ", dim=" << std::dec << static_cast<uint32_t>(desc.Dimension) << ", w=" << desc.Width
+                      << ") fallback committed -> 0x" << std::hex << static_cast<uint32_t>(r) << " (open hr=0x"
+                      << static_cast<uint32_t>(hr) << ")" << std::dec << "\n";
+        }
+        return r;
+    }
+    auto* proxy = new XboxD3D12ResourceProxy();
+    proxy->lpVtbl = kXboxResourceProxyVtbl.data();
+    proxy->device = obj;
+    obj->ref_count.fetch_add(1, std::memory_order_relaxed);
+    proxy->pc_res = pc_res;
+    proxy->tracked_state.store(static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON), std::memory_order_relaxed);
+    proxy->guest_format = desc.Format;
+    *out = proxy;
+    if (address && desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        RegisterGuestGpuRange(address, desc.Width, pc_res->GetGPUVirtualAddress());
+    }
+    if (TraceEnabled()) {
+        std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreatePlacedResourceX(va=0x" << std::hex << address
+                  << ", w=0x" << desc.Width << ") -> " << path << std::dec << "\n";
+    }
+    return 0;
+#else
+    return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
+#endif
+}
+
 intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateFence(
     void* self, uintptr_t initialValue, uintptr_t flags, uintptr_t /*riid*/, uintptr_t ppFence) {
 #if defined(_WIN32)
@@ -3755,6 +4576,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateFence(
     ID3D12Fence* pc_fence = nullptr;
     const HRESULT hr = obj->pc_device->CreateFence(
         initialValue, static_cast<D3D12_FENCE_FLAGS>(flags), IID_PPV_ARGS(&pc_fence));
+    CheckDeviceRemoved(obj->pc_device, "CreateFence");
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateFence(init="
                   << initialValue << ", flags=0x" << std::hex << flags << ") -> 0x"
@@ -3807,6 +4629,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateQueryHeap(
     ID3D12QueryHeap* pc_qh = nullptr;
     const HRESULT hr = obj->pc_device->CreateQueryHeap(
         reinterpret_cast<const D3D12_QUERY_HEAP_DESC*>(pDesc), IID_PPV_ARGS(&pc_qh));
+    CheckDeviceRemoved(obj->pc_device, "CreateQueryHeap");
     if (FAILED(hr) || !pc_qh) return static_cast<intptr_t>(hr);
     auto* proxy = new XboxD3D12SimpleObjectProxy();
     proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
@@ -3830,13 +4653,33 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandSignature(
         ? reinterpret_cast<ID3D12RootSignature*>(reinterpret_cast<XboxD3D12SimpleObjectProxy*>(pRootSig)->pc_obj)
         : nullptr;
     ID3D12CommandSignature* pc_sig = nullptr;
-    const HRESULT hr = obj->pc_device->CreateCommandSignature(
-        reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(pDesc), pc_rs, IID_PPV_ARGS(&pc_sig));
+    // Console-only argument types (>= 100) are mapped to their PC equivalent.
+    // 105 is used with a 12-byte stride, i.e. three thread-group counts; it is
+    // taken to be the console's mesh dispatch (an assumption, not verified).
+    D3D12_COMMAND_SIGNATURE_DESC sig = *reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(pDesc);
+    std::vector<D3D12_INDIRECT_ARGUMENT_DESC> args(sig.pArgumentDescs, sig.pArgumentDescs + sig.NumArgumentDescs);
+    for (auto& a : args) {
+        const auto t = static_cast<uint32_t>(a.Type);
+        if (t == 105) a.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+        else if (t >= 100) {
+            std::cerr << "[ScarlettX][d3d12_xs] CreateCommandSignature: unknown console argument type " << t << "\n";
+        }
+    }
+    sig.pArgumentDescs = args.data();
+    const HRESULT hr = obj->pc_device->CreateCommandSignature(&sig, pc_rs, IID_PPV_ARGS(&pc_sig));
+    CheckDeviceRemoved(obj->pc_device, "CreateCommandSignature");
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateCommandSignature() -> 0x"
                   << std::hex << static_cast<uint32_t>(hr) << std::dec << "\n";
     }
-    if (FAILED(hr) || !pc_sig) return static_cast<intptr_t>(hr);
+    if (FAILED(hr) || !pc_sig) {
+        DumpD3D12InfoQueue(obj->pc_device, "CreateCommandSignature");
+        const auto* d = reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(pDesc);
+        std::cerr << "[ScarlettX][d3d12_xs] CreateCommandSignature failed: stride=" << d->ByteStride << " args=" << d->NumArgumentDescs << " rs=" << pc_rs;
+        for (UINT i = 0; i < d->NumArgumentDescs; ++i) std::cerr << " [" << static_cast<int>(d->pArgumentDescs[i].Type) << "]";
+        std::cerr << "\n";
+        return static_cast<intptr_t>(hr);
+    }
     auto* proxy = new XboxD3D12SimpleObjectProxy();
     proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
     proxy->pc_obj = pc_sig;
@@ -3994,8 +4837,13 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyWaitFrameEventX(
     return 0;
 }
 
-std::array<ComVtableFn, 128> BuildXboxDeviceProxyVtable() {
-    auto vtbl = MakeProxyVtable(std::make_index_sequence<125>{});
+std::array<ComVtableFn, 256> BuildXboxDeviceProxyVtable() {
+    auto vtbl = MakeProxyVtable(std::make_index_sequence<253>{});
+    vtbl[133] = reinterpret_cast<ComVtableFn>(&ProxyCreatePlacedResourceX);                  // +0x428
+    vtbl[127] = reinterpret_cast<ComVtableFn>(&ProxyCreateCommittedResource3);               // +0x3f8
+    vtbl[74] = &ProxyCreateHeapFromPhysicalPagesX;                                         // +0x250
+    vtbl[86] = &ProxyCreatePipelineStateStream;                                           // +0x2b0
+    vtbl[61] = &ProxyCreateSamplerX;                                                      // +0x1e8
     vtbl[6] = &ProxySetName;                                                           // +0x30
     vtbl[7] = &ProxyGetNodeCount;                                                      // +0x38
     vtbl[8] = &ProxyCreateCommandQueue;                                                // +0x40
@@ -4035,7 +4883,7 @@ std::array<ComVtableFn, 128> BuildXboxDeviceProxyVtable() {
     return vtbl;
 }
 
-const std::array<ComVtableFn, 128> kXboxDeviceProxyVtbl = BuildXboxDeviceProxyVtable();
+const std::array<ComVtableFn, 256> kXboxDeviceProxyVtbl = BuildXboxDeviceProxyVtable();
 
 }  // namespace
 
@@ -4089,6 +4937,18 @@ int32_t SCARLETTX_GDK_CALLBACK D3D12XboxCreateDevice(
         if (SUCCEEDED(CallSystemD3D12GetDebugInterface(__uuidof(ID3D12Debug), reinterpret_cast<void**>(&dbg))) && dbg) {
             dbg->EnableDebugLayer();
             dbg->Release();
+        }
+    }
+    if (const char* dred = std::getenv("SCARLETTX_DRED"); dred && dred[0] == '1') {
+        // Device Removed Extended Data: breadcrumbs and GPU page-fault info,
+        // reported by ReportDred() when the device is found removed.
+        ID3D12DeviceRemovedExtendedDataSettings* s = nullptr;
+        if (SUCCEEDED(CallSystemD3D12GetDebugInterface(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
+                                                       reinterpret_cast<void**>(&s))) && s) {
+            s->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            s->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            s->Release();
+            std::cerr << "[ScarlettX][d3d12_xs] DRED enabled\n";
         }
     }
 
@@ -4161,6 +5021,21 @@ int32_t SCARLETTX_GDK_CALLBACK D3D12XboxCreateDevice(
         auto* proxy = new XboxD3D12DeviceProxy();
         proxy->lpVtbl = kXboxDeviceProxyVtbl.data();
         proxy->sdk_version = pParameters ? pParameters->Version : 0;
+        g_host_device.store(pc_dev, std::memory_order_release);
+        if (const char* b = std::getenv("SCARLETTX_D3D12_BREAK"); b && b[0] == '1') {
+            // With the debug layer on: raise a breakpoint inside the first
+            // invalid call, so a crash log shows who made it.
+            ID3D12InfoQueue* q = nullptr;
+            if (SUCCEEDED(pc_dev->QueryInterface(__uuidof(ID3D12InfoQueue), reinterpret_cast<void**>(&q))) && q) {
+                q->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
+                q->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
+                q->Release();
+            }
+        }
+        if (TraceEnabled()) {
+            std::cerr << "[ScarlettX][d3d12_xs] device SDK version 0x" << std::hex << proxy->sdk_version
+                      << std::dec << "\n";
+        }
         proxy->pc_device = pc_dev;
         proxy->pc_adapter = adapter;  // transfers ownership
         *ppvDevice = proxy;

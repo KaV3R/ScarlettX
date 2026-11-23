@@ -29,6 +29,7 @@
 #include "scarlettx/kernel/xruntime.h"
 #include "xgr_api_tables.h"
 #include "xgr_task_queue.h"
+#include "xmem_physical.h"
 
 namespace fs = std::filesystem;
 
@@ -1249,8 +1250,37 @@ void* XMemVirtualAlloc(
     DWORD flAlloc = static_cast<DWORD>(flAllocationType) & ~kPageSizeBits;
     if (flAlloc == 0) flAlloc = MEM_RESERVE | MEM_COMMIT;
     if (!lpAddress && (flAlloc & MEM_COMMIT)) flAlloc |= MEM_RESERVE;
-    const DWORD protect = flProtect ? static_cast<DWORD>(flProtect) : PAGE_READWRITE;
+    // Console titles pass PAGE_GRAPHICS_* bits (0x800..0x40000), sometimes
+    // OR'ed with a plain PAGE_* value. Host VirtualAlloc rejects them, so keep
+    // the host-valid low bits and translate graphics-only protections.
+    DWORD protect = static_cast<DWORD>(flProtect) & 0x7FFu;
+    if ((protect & 0xFFu) == 0) {
+        const DWORD gfx = static_cast<DWORD>(flProtect);
+        DWORD base = PAGE_READWRITE;
+        if (gfx & 0x10000u) base = PAGE_EXECUTE_READWRITE;      // GRAPHICS_EXECUTE_READWRITE
+        else if (gfx & 0x8000u) base = PAGE_EXECUTE_READ;       // GRAPHICS_EXECUTE_READ
+        else if (gfx & 0x4000u) base = PAGE_EXECUTE;            // GRAPHICS_EXECUTE
+        else if (gfx & 0x2000u) base = PAGE_READWRITE;          // GRAPHICS_READWRITE
+        else if (gfx & 0x1000u) base = PAGE_READONLY;           // GRAPHICS_READONLY
+        else if (gfx & 0x800u) base = PAGE_NOACCESS;            // GRAPHICS_NOACCESS
+        protect = (protect & 0x700u) | base;
+    }
+    if ((protect & 0xFFu) == PAGE_NOACCESS) protect = PAGE_NOACCESS;  // modifiers invalid with NOACCESS
     const size_t size = (dwSize + page - 1) & ~(page - 1);
+    if (flAlloc & (0x00040000u /*MEM_RESERVE_PLACEHOLDER*/ | 0x00004000u /*MEM_REPLACE_PLACEHOLDER*/)) {
+        return ScxXMemPlaceholderAlloc(lpAddress, dwSize, flAlloc, protect, page);
+    }
+    // 64 KB / 2 MB reservations may later receive physical pages
+    // (XMemMapPhysicalPages), so they are made host placeholders.
+    if (!lpAddress && page >= 0x10000 && (flAlloc & (MEM_RESERVE | MEM_COMMIT)) == MEM_RESERVE) {
+        if (void* p = ScxXMemReservePlaceholder(size, page, protect)) return p;
+    }
+    if (lpAddress && (flAlloc & MEM_COMMIT)) {
+        void* out = nullptr;
+        if (ScxXMemCommitInPlaceholder(lpAddress, dwSize, protect == PAGE_NOACCESS ? PAGE_READWRITE : protect, &out)) {
+            return out;
+        }
+    }
     if (lpAddress || page <= 0x10000) {
         return VirtualAlloc(lpAddress, size, flAlloc, protect);
     }
